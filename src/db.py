@@ -270,6 +270,22 @@ async def set_response_sent(vacancy_id: int, sent: bool) -> bool:
         return cur.rowcount > 0
 
 
+async def get_latest_response_text(vacancy_id: int) -> Optional[str]:
+    await init_db()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT text FROM responses
+            WHERE vacancy_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (vacancy_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else None
+
+
 async def get_ai_vacancies(limit: int = 20) -> list[dict]:
     await init_db()
     async with aiosqlite.connect(DB_PATH) as db:

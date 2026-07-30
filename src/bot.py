@@ -1,8 +1,9 @@
 import asyncio
 import logging
+import re
 from typing import Optional
 
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, CopyTextButton
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -21,6 +22,7 @@ from src.db import (
     get_channel_by_id,
     add_response,
     set_response_sent,
+    get_latest_response_text,
     get_channels,
     add_channel,
     get_filter_settings,
@@ -40,6 +42,101 @@ logger = logging.getLogger(__name__)
 _parser: Optional[Parser] = None
 _app: Optional[Application] = None
 _batch_running = False
+COPY_TEXT_MAX = 256
+
+CHANNEL_LINK_RE = re.compile(
+    r"^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/(@?[A-Za-z0-9_]+)(?:/\d+)?/?$",
+    re.IGNORECASE,
+)
+CHANNEL_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{4,32}$")
+RESERVED_TG_PATHS = {
+    "joinchat",
+    "addstickers",
+    "share",
+    "proxy",
+    "socks",
+    "iv",
+    "login",
+    "s",
+    "c",
+}
+
+
+def _clear_awaiting(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.user_data is None:
+        return
+    context.user_data.pop("awaiting_setting", None)
+    context.user_data.pop("awaiting_channel", None)
+
+
+def parse_channel_input(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        raise ValueError("Пустое значение. Пришли ссылку или никнейм.")
+    text = text.split()[0].strip()
+    if text.startswith("+") or "/+" in text or "joinchat" in text.lower():
+        raise ValueError(
+            "Приватные invite-ссылки не поддерживаются. "
+            "Пришли публичный @username или https://t.me/username"
+        )
+    match = CHANNEL_LINK_RE.match(text)
+    if match:
+        name = match.group(1).lstrip("@")
+        if name.lower() in RESERVED_TG_PATHS:
+            raise ValueError(
+                "Это не ссылка на канал. Пример: https://t.me/FreelancehuntProjects"
+            )
+        if not CHANNEL_USERNAME_RE.fullmatch(name):
+            raise ValueError("Некорректный username в ссылке.")
+        return f"@{name}"
+    name = text[1:] if text.startswith("@") else text
+    if not CHANNEL_USERNAME_RE.fullmatch(name):
+        raise ValueError(
+            "Не понял канал.\n"
+            "Примеры:\n"
+            "@FreelancehuntProjects\n"
+            "FreelancehuntProjects\n"
+            "https://t.me/FreelancehuntProjects"
+        )
+    return f"@{name}"
+
+
+async def _save_channel_and_reply(message, username: str) -> None:
+    channel_id = await add_channel(username, title=username)
+    note = ""
+    if await get_parse_mode() == PARSE_MODE_REALTIME:
+        try:
+            parser = await _get_parser()
+            if parser.is_listening:
+                await parser.stop_realtime()
+            note = "\n" + await _ensure_realtime(start=True)
+        except Exception as exc:
+            note = f"\nRealtime не перезапущен: {exc}"
+    await message.reply_text(f"Канал сохранен: {username}\nID: {channel_id}{note}")
+
+
+def _response_actions_keyboard(vacancy_id: int, reply_text: str) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if 1 <= len(reply_text) <= COPY_TEXT_MAX:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "Скопировать",
+                    copy_text=CopyTextButton(text=reply_text),
+                )
+            ]
+        )
+    else:
+        rows.append(
+            [InlineKeyboardButton("Скопировать", callback_data=f"response:copy:{vacancy_id}")]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton("Да", callback_data=f"response:confirm:{vacancy_id}:1"),
+            InlineKeyboardButton("Нет", callback_data=f"response:confirm:{vacancy_id}:0"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
 
 FILTER_LABELS = {
     "filter_stack": "Стек / навыки",
@@ -83,10 +180,11 @@ def _main_keyboard() -> InlineKeyboardMarkup:
 def _format_accepted_message(post: dict) -> tuple[str, InlineKeyboardMarkup]:
     body = (post.get("text") or "").strip()
     link = (post.get("link") or "").strip()
-    prefix = f"Исходный пост: {link}\n\n" if link else ""
-    msg = prefix + body
-    if len(msg) > 4000:
-        msg = msg[:3990] + "..."
+    suffix = f"\n\nИсходный пост: {link}" if link else ""
+    max_body = 4000 - len(suffix)
+    if len(body) > max_body:
+        body = body[: max(0, max_body - 3)] + "..."
+    msg = body + suffix
     keyboard = InlineKeyboardMarkup(
         [[InlineKeyboardButton("сгенерировать ответ", callback_data=f"response:generate:{post.get('id')}")]]
     )
@@ -169,7 +267,7 @@ async def _realtime_status_text() -> str:
     names = [c.get("username") or c.get("title") or str(c.get("id")) for c in channels]
     status = "слушает" if parser.is_listening else "остановлен"
     watched = ", ".join(parser.watch_usernames) if parser.watch_usernames else "—"
-    ch_list = ", ".join(names) if names else "нет (добавь /add_channel @username)"
+    ch_list = ", ".join(names) if names else "нет (добавь /add_channel)"
     return (
         f"Парсинг в реальном времени\n"
         f"Статус: {status}\n"
@@ -192,8 +290,7 @@ async def _realtime_keyboard() -> InlineKeyboardMarkup:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not _only_admin(update.effective_user.id):
         return
-    if context.user_data is not None:
-        context.user_data.pop("awaiting_setting", None)
+    _clear_awaiting(context)
     target = update.effective_message
     if target is None:
         return
@@ -206,26 +303,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def add_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not _only_admin(update.effective_user.id):
         return
-    if not context.args:
-        await update.message.reply_text("Используй: /add_channel @username")
+    if context.user_data is None:
         return
-    username = context.args[0].strip()
-    try:
-        channel_id = await add_channel(username, title=username)
-        mode = await get_parse_mode()
-        note = ""
-        if mode == PARSE_MODE_REALTIME:
-            try:
-                parser = await _get_parser()
-                if parser.is_listening:
-                    await parser.stop_realtime()
-                note = "\n" + await _ensure_realtime(start=True)
-            except Exception as exc:
-                note = f"\nRealtime не перезапущен: {exc}"
-        await update.message.reply_text(f"Канал сохранен: {username}\nID: {channel_id}{note}")
-    except Exception as exc:
-        logger.exception("Add channel failed")
-        await update.message.reply_text(f"Ошибка: {exc}")
+    # Optional shortcut: /add_channel @username
+    if context.args:
+        try:
+            username = parse_channel_input(" ".join(context.args))
+            context.user_data.pop("awaiting_channel", None)
+            context.user_data.pop("awaiting_setting", None)
+            await _save_channel_and_reply(update.message, username)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+        except Exception as exc:
+            logger.exception("Add channel failed")
+            await update.message.reply_text(f"Ошибка: {exc}")
+        return
+
+    context.user_data.pop("awaiting_setting", None)
+    context.user_data["awaiting_channel"] = True
+    await update.message.reply_text(
+        "Пришли ссылку на канал или никнейм одним сообщением.\n\n"
+        "Примеры:\n"
+        "@FreelancehuntProjects\n"
+        "FreelancehuntProjects\n"
+        "https://t.me/FreelancehuntProjects",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Отмена", callback_data="back:menu")]]
+        ),
+    )
 
 
 async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -233,7 +338,7 @@ async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     channels = await get_channels(limit=50)
     if not channels:
-        await update.message.reply_text("Каналов нет. Добавь через /add_channel @username")
+        await update.message.reply_text("Каналов нет. Добавь через /add_channel")
         return
     lines = [f"{c['id']}. {c['username'] or c['title']}" for c in channels]
     await update.message.reply_text("Каналы:\n" + "\n".join(lines))
@@ -245,8 +350,7 @@ async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     await query.answer()
-    if context.user_data is not None:
-        context.user_data.pop("awaiting_setting", None)
+    _clear_awaiting(context)
     mode = query.data.split(":")[1]
     if mode != Mode.PARSER and mode != Mode.RESPONSE:
         await query.message.reply_text("Неизвестный режим")
@@ -271,7 +375,7 @@ async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         channels = await get_channels(limit=50)
         if not channels:
             await query.message.reply_text(
-                "Каналов нет. Добавь через /add_channel @username"
+                "Каналов нет. Добавь через /add_channel"
             )
             return
         keyboard = [
@@ -297,8 +401,7 @@ async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not query or not query.from_user or not _only_admin(query.from_user.id):
         return
     await query.answer()
-    if context.user_data is not None:
-        context.user_data.pop("awaiting_setting", None)
+    _clear_awaiting(context)
     await query.message.reply_text(
         await _settings_status_text(),
         reply_markup=await _settings_keyboard(),
@@ -336,7 +439,9 @@ async def settings_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if key not in FILTER_KEYS:
         await query.message.reply_text("Неизвестное поле")
         return
-    context.user_data["awaiting_setting"] = key
+    if context.user_data is not None:
+        context.user_data.pop("awaiting_channel", None)
+        context.user_data["awaiting_setting"] = key
     current = (await get_filter_settings()).get(key) or ""
     current_line = current if current.strip() else "(пусто)"
     await query.message.reply_text(
@@ -353,7 +458,24 @@ async def settings_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def settings_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not _only_admin(update.effective_user.id):
         return
-    key = (context.user_data or {}).get("awaiting_setting")
+    user_data = context.user_data or {}
+
+    if user_data.get("awaiting_channel"):
+        value = (update.message.text or "").strip()
+        try:
+            username = parse_channel_input(value)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        context.user_data.pop("awaiting_channel", None)
+        try:
+            await _save_channel_and_reply(update.message, username)
+        except Exception as exc:
+            logger.exception("Add channel failed")
+            await update.message.reply_text(f"Ошибка: {exc}")
+        return
+
+    key = user_data.get("awaiting_setting")
     if not key:
         return
     value = (update.message.text or "").strip()
@@ -549,19 +671,43 @@ async def list_accepted_vacancies(update: Update, context: ContextTypes.DEFAULT_
         reply_text = await generate_response_text(vacancy["text"])
         await add_response(vacancy_id, query.from_user.id, reply_text)
         preview = f"Отклик готов:\n\n{reply_text}\n\nОтослано в канал?"
-        keyboard = [
-            [
-                InlineKeyboardButton("Да", callback_data=f"response:confirm:{vacancy_id}:1"),
-                InlineKeyboardButton("Нет", callback_data=f"response:confirm:{vacancy_id}:0"),
-            ]
-        ]
         await query.message.reply_text(
             preview,
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            reply_markup=_response_actions_keyboard(vacancy_id, reply_text),
         )
     except Exception as exc:
         logger.exception("Response generation failed")
         await query.message.reply_text(f"Ошибка: {exc}")
+
+
+async def copy_response_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.from_user or not _only_admin(query.from_user.id):
+        return
+    vacancy_id = int(query.data.split(":")[-1])
+    text = await get_latest_response_text(vacancy_id)
+    if not text:
+        await query.answer("Отклик не найден", show_alert=True)
+        return
+    if len(text) <= COPY_TEXT_MAX:
+        await query.answer()
+        await query.message.reply_text(
+            "Нажми кнопку, чтобы скопировать:",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "Скопировать",
+                            copy_text=CopyTextButton(text=text),
+                        )
+                    ]
+                ]
+            ),
+        )
+        return
+    await query.answer("Текст отправлен отдельным сообщением")
+    # Plain message so Telegram clients can long-press → Copy
+    await query.message.reply_text(text)
 
 
 async def confirm_sent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -586,8 +732,7 @@ async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not query or not query.from_user or not _only_admin(query.from_user.id):
         return
     await query.answer()
-    if context.user_data is not None:
-        context.user_data.pop("awaiting_setting", None)
+    _clear_awaiting(context)
     await query.message.reply_text(
         "Freelance parser: выбери режим",
         reply_markup=_main_keyboard(),
@@ -643,6 +788,7 @@ def build_bot() -> None:
     app.add_handler(CallbackQueryHandler(channel_limit_callback, pattern=r"^parser:channel:\d+$"))
     app.add_handler(CallbackQueryHandler(run_parser_callback, pattern=r"^parser:run:\d+:\d+$"))
     app.add_handler(CallbackQueryHandler(list_accepted_vacancies, pattern=r"^response:generate:\d+$"))
+    app.add_handler(CallbackQueryHandler(copy_response_callback, pattern=r"^response:copy:\d+$"))
     app.add_handler(CallbackQueryHandler(confirm_sent, pattern=r"^response:confirm:\d+:[01]$"))
     app.add_handler(CallbackQueryHandler(back_to_menu, pattern=r"^back:menu$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, settings_text_input))

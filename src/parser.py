@@ -219,7 +219,7 @@ class Parser:
                     logger.warning("Skip channel %s: %s", uname, exc)
             if not entities:
                 raise RuntimeError(
-                    "Нет каналов для прослушивания. Добавь через /add_channel @username"
+                    "Нет каналов для прослушивания. Добавь через /add_channel"
                 )
 
             await self.stop_realtime()

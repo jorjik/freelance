@@ -1,0 +1,36 @@
+# Secrets & local config
+.env
+.env.local
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+
+# Runtime data
+*.db
+*.db-*
+*.session
+*.session-journal
+*.session.*
+downloads/
+sessions/
+
+# Upload/temp artifacts
+_chunks/
+*.z64
+*.b64
+_upload_patch.b64
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

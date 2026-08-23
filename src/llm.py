@@ -1,9 +1,44 @@
+import asyncio
 import json
-from typing import Any
+import logging
+import time
+from typing import Any, Callable, Optional
 
 import httpx
 
 from src.config import settings
+
+logger = logging.getLogger(__name__)
+
+# Notification callback: called when API fails after retries
+# Signature: async def notify(message: str) -> None
+_notify_callback: Optional[Callable] = None
+
+# Track consecutive failures for notification throttling
+_consecutive_failures = 0
+_last_failure_notify = 0.0
+FAILURE_NOTIFY_INTERVAL = 300  # Notify at most once per 5 minutes
+
+
+async def _notify_admin(message: str) -> None:
+    """Send notification to admin if callback is registered."""
+    global _consecutive_failures, _last_failure_notify
+    if _notify_callback is None:
+        return
+    now = time.time()
+    if now - _last_failure_notify < FAILURE_NOTIFY_INTERVAL:
+        return
+    _last_failure_notify = now
+    try:
+        await _notify_callback(message)
+    except Exception:
+        logger.exception("Failed to send admin notification")
+
+
+def set_notify_callback(callback: Callable) -> None:
+    """Register callback for API error notifications."""
+    global _notify_callback
+    _notify_callback = callback
 
 SYSTEM_PROMPT = (
     "Ты фильтруешь фриланс-вакансии строго по критериям пользователя. "
@@ -33,6 +68,58 @@ def normalize_decision(value: Any) -> str:
     return decision
 
 
+async def _call_llm_with_retry(payload: dict, max_retries: int = 3) -> dict:
+    """Call LLM API with exponential backoff retry."""
+    global _consecutive_failures
+    last_error = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"{settings.llm_base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {settings.llm_api_key}"},
+                    json=payload,
+                )
+                resp.raise_for_status()
+                result = resp.json()
+                # Success — reset failure counter
+                _consecutive_failures = 0
+                return result
+        except httpx.HTTPStatusError as e:
+            last_error = e
+            status = e.response.status_code
+            # Don't retry on client errors (except 429 rate limit)
+            if 400 <= status < 500 and status != 429:
+                logger.warning(f"LLM API client error {status}: {e}")
+                _consecutive_failures += 1
+                if _consecutive_failures >= 3:
+                    await _notify_admin(
+                        f"⚠️ LLM API ошибка {status} (повторяется).\n"
+                        f"Проверь API ключ и баланс."
+                    )
+                raise
+            # Retry on 429, 500, 502, 503, 504
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            last_error = e
+            logger.warning(f"LLM API connection error: {e}")
+
+        # Exponential backoff: 1s, 2s, 4s...
+        if attempt < max_retries:
+            wait_time = 2 ** attempt
+            logger.info(f"Retry {attempt + 1}/{max_retries} after {wait_time}s...")
+            await asyncio.sleep(wait_time)
+
+    # All retries exhausted
+    _consecutive_failures += 1
+    if _consecutive_failures >= 3:
+        await _notify_admin(
+            f"🔴 LLM API недоступен после {max_retries + 1} попыток.\n"
+            f"Последняя ошибка: {last_error}"
+        )
+    raise last_error
+
+
 async def judge_vacancy(text: str, filter_rules: dict) -> dict:
     prompt = (
         "Оцени вакансию ТОЛЬКО по критериям ниже.\n"
@@ -54,14 +141,8 @@ async def judge_vacancy(text: str, filter_rules: dict) -> dict:
             {"role": "user", "content": prompt},
         ],
     }
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            f"{settings.llm_base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-            json=payload,
-        )
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
+    result = await _call_llm_with_retry(payload)
+    content = result["choices"][0]["message"]["content"]
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
@@ -94,11 +175,5 @@ async def generate_response_text(vacancy_text: str) -> str:
             {"role": "user", "content": prompt},
         ],
     }
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            f"{settings.llm_base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-            json=payload,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+    result = await _call_llm_with_retry(payload)
+    return result["choices"][0]["message"]["content"].strip()

@@ -1,0 +1,14 @@
+.git
+.env
+.env.*
+__pycache__
+*.pyc
+*.pyo
+.venv
+venv
+*.db
+*.sqlite
+chunks/
+_freebuff/
+.gitignore
+README.md

@@ -34,3 +34,6 @@ _upload_patch.b64
 Thumbs.db
 .idea/
 .vscode/
+
+# Freebuff
+.freebuff/

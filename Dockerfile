@@ -2,12 +2,11 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install dependencies first for better layer caching
-COPY pyproject.toml .
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# Copy source code
+COPY pyproject.toml README.md ./
 COPY src/ src/
 
-# Run the bot
+RUN pip install --no-cache-dir .
+
 CMD ["python", "-m", "src.main"]

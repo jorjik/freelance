@@ -773,8 +773,16 @@ async def _post_init(application: Application) -> None:
         if mode == PARSE_MODE_REALTIME:
             msg = await _ensure_realtime(start=True)
             logger.info(msg)
-    except Exception:
+    except Exception as exc:
         logger.exception("Failed to autostart realtime parser")
+        if _app is not None:
+            try:
+                await _app.bot.send_message(
+                    chat_id=settings.admin_telegram_id,
+                    text=f"⚠️ Не удалось запустить realtime при старте:\n{exc}",
+                )
+            except Exception:
+                logger.exception("Failed to notify admin about startup failure")
 
 
 async def _post_shutdown(application: Application) -> None:

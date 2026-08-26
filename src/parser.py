@@ -205,6 +205,7 @@ class Parser:
             channels = await get_channels(limit=100)
             usernames = []
             entities = []
+            errors: list[str] = []
             for ch in channels:
                 uname = (ch.get("username") or "").strip()
                 if not uname:
@@ -216,10 +217,13 @@ class Parser:
                     entities.append(entity)
                     usernames.append(uname)
                 except Exception as exc:
+                    err = f"{uname}: {exc}"
+                    errors.append(err)
                     logger.warning("Skip channel %s: %s", uname, exc)
             if not entities:
+                detail = "\n".join(errors) if errors else "(список каналов пуст)"
                 raise RuntimeError(
-                    "Нет каналов для прослушивания. Добавь через /add_channel"
+                    f"Не удалось подключиться к каналам:\n{detail}"
                 )
 
             await self.stop_realtime()

@@ -5,8 +5,22 @@ from typing import Optional
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DB_PATH = PROJECT_ROOT / "freelance_parser.db"
 OLD_DB_PATH = Path("/root/.freelance_parser.db")
+
+
+def _get_db_path() -> Path:
+    from src.config import settings
+    raw = (settings.database_path or "").strip()
+    if raw:
+        p = Path(raw)
+        if not p.is_absolute():
+            p = PROJECT_ROOT / p
+        return p
+    return PROJECT_ROOT / "freelance_parser.db"
+
+
+def _db_path() -> Path:
+    return _get_db_path()
 
 FILTER_KEYS = (
     "filter_stack",
@@ -24,10 +38,10 @@ DEFAULT_PARSE_MODE = PARSE_MODE_REALTIME
 
 
 def _migrate_old_db() -> None:
-    if DB_PATH.exists():
+    if _db_path().exists():
         return
     if OLD_DB_PATH.exists():
-        shutil.copy2(OLD_DB_PATH, DB_PATH)
+        shutil.copy2(OLD_DB_PATH, _db_path())
 
 
 async def _ensure_column(db: aiosqlite.Connection, table: str, column: str, ddl: str) -> None:
@@ -39,7 +53,7 @@ async def _ensure_column(db: aiosqlite.Connection, table: str, column: str, ddl:
 
 async def init_db() -> None:
     _migrate_old_db()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(_db_path()) as db:
         await db.executescript(
             """
             PRAGMA journal_mode=WAL;
@@ -92,7 +106,7 @@ async def init_db() -> None:
 
 async def get_setting(key: str) -> Optional[str]:
     await init_db()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(_db_path()) as db:
         async with db.execute("SELECT value FROM settings WHERE key = ?", (key,)) as cur:
             row = await cur.fetchone()
             return row[0] if row else None
@@ -100,7 +114,7 @@ async def get_setting(key: str) -> Optional[str]:
 
 async def set_setting(key: str, value: str) -> None:
     await init_db()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(_db_path()) as db:
         await db.execute(
             "INSERT INTO settings(key, value) VALUES(?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -112,7 +126,7 @@ async def set_setting(key: str, value: str) -> None:
 async def get_filter_settings() -> dict[str, str]:
     await init_db()
     result = {k: "" for k in FILTER_KEYS}
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(_db_path()) as db:
         async with db.execute(
             f"SELECT key, value FROM settings WHERE key IN ({','.join('?' for _ in FILTER_KEYS)})",
             FILTER_KEYS,
@@ -139,7 +153,7 @@ async def set_parse_mode(mode: str) -> str:
 
 async def get_vacancy_decision(vacancy_id: int) -> Optional[str]:
     await init_db()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(_db_path()) as db:
         async with db.execute(
             "SELECT ai_decision FROM vacancies WHERE id = ?", (vacancy_id,)
         ) as cur:
@@ -149,7 +163,7 @@ async def get_vacancy_decision(vacancy_id: int) -> Optional[str]:
 
 async def get_vacancy_by_id(vacancy_id: int) -> Optional[dict]:
     await init_db()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(_db_path()) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """
@@ -167,7 +181,7 @@ async def get_vacancy_by_id(vacancy_id: int) -> Optional[dict]:
 
 async def get_channel_by_id(channel_id: int) -> Optional[dict]:
     await init_db()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(_db_path()) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT id, username, title, is_active, added_at FROM channels WHERE id = ?",
@@ -184,7 +198,7 @@ async def are_filter_settings_complete() -> bool:
 
 async def add_channel(username: str, title: Optional[str] = None) -> int:
     await init_db()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(_db_path()) as db:
         db.row_factory = aiosqlite.Row
         await db.execute(
             "INSERT OR IGNORE INTO channels(username, title) VALUES(?, ?)",
@@ -207,7 +221,7 @@ async def upsert_vacancy(
 ) -> tuple[Optional[int], bool]:
     """Return (vacancy_id, is_new). is_new=False if row already existed."""
     await init_db()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(_db_path()) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
             """
@@ -231,7 +245,7 @@ async def upsert_vacancy(
 
 async def update_vacancy_ai(vacancy_id: int, decision: str, reason: str) -> None:
     await init_db()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(_db_path()) as db:
         await db.execute(
             "UPDATE vacancies SET ai_decision = ?, ai_reason = ? WHERE id = ?",
             (decision, reason, vacancy_id),
@@ -241,7 +255,7 @@ async def update_vacancy_ai(vacancy_id: int, decision: str, reason: str) -> None
 
 async def add_response(vacancy_id: int, telegram_id: int, text: str) -> int:
     await init_db()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(_db_path()) as db:
         cur = await db.execute(
             "INSERT INTO responses(vacancy_id, telegram_id, text, sent) VALUES(?, ?, ?, 0)",
             (vacancy_id, telegram_id, text),
@@ -252,7 +266,7 @@ async def add_response(vacancy_id: int, telegram_id: int, text: str) -> int:
 
 async def set_response_sent(vacancy_id: int, sent: bool) -> bool:
     await init_db()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(_db_path()) as db:
         cur = await db.execute(
             """
             UPDATE responses
@@ -272,7 +286,7 @@ async def set_response_sent(vacancy_id: int, sent: bool) -> bool:
 
 async def get_latest_response_text(vacancy_id: int) -> Optional[str]:
     await init_db()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(_db_path()) as db:
         async with db.execute(
             """
             SELECT text FROM responses
@@ -288,7 +302,7 @@ async def get_latest_response_text(vacancy_id: int) -> Optional[str]:
 
 async def get_ai_vacancies(limit: int = 20) -> list[dict]:
     await init_db()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(_db_path()) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """
@@ -307,7 +321,7 @@ async def get_ai_vacancies(limit: int = 20) -> list[dict]:
 
 async def get_channels(limit: int = 50) -> list[dict]:
     await init_db()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(_db_path()) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT id, username, title, is_active, added_at FROM channels ORDER BY added_at DESC LIMIT ?",

@@ -13,8 +13,10 @@ from src.db import init_db
 
 
 async def main() -> None:
+    Path("sessions").mkdir(exist_ok=True)
+    session_path = str(Path("sessions") / settings.parser_session_name)
     client = TelegramClient(
-        settings.parser_session_name,
+        session_path,
         settings.telegram_api_id,
         settings.telegram_api_hash,
     )

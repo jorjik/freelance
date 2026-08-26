@@ -28,7 +28,9 @@ DOWNLOADS_DIR = Path("downloads")
 
 class Parser:
     def __init__(self) -> None:
-        self.session_path = Path(settings.parser_session_name).with_suffix(".session")
+        SESSIONS_DIR = Path("sessions")
+        SESSIONS_DIR.mkdir(exist_ok=True)
+        self.session_path = (SESSIONS_DIR / settings.parser_session_name).with_suffix(".session")
         self.client = TelegramClient(
             str(self.session_path),
             settings.telegram_api_id,

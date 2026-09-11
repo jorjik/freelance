@@ -137,11 +137,19 @@ async def get_filter_settings() -> dict[str, str]:
 
 
 LLM_API_KEY_SETTING = "llm_api_key"
+LLM_MODEL_SETTING = "llm_model"
 
 
 async def get_llm_api_key() -> Optional[str]:
     """API key set via chat (overrides the .env one). None if not set."""
     value = await get_setting(LLM_API_KEY_SETTING)
+    value = (value or "").strip()
+    return value or None
+
+
+async def get_llm_model() -> Optional[str]:
+    """Model set via chat (overrides the .env one). None if not set."""
+    value = await get_setting(LLM_MODEL_SETTING)
     value = (value or "").strip()
     return value or None
 

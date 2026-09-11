@@ -40,6 +40,7 @@ from src.db import (
     are_filter_settings_complete,
     FILTER_KEYS,
     LLM_API_KEY_SETTING,
+    LLM_MODEL_SETTING,
     get_parse_mode,
     set_parse_mode,
     PARSE_MODE_REALTIME,
@@ -50,10 +51,12 @@ from src.llm import (
     QuotaPausedError,
     generate_response_text,
     get_llm_api_key,
+    get_llm_model,
     is_quota_paused,
     mask_key,
     quota_cooldown_remaining,
     set_llm_api_key,
+    set_llm_model,
     set_notify_callback,
 )
 from src.parser import Parser
@@ -89,6 +92,7 @@ def _clear_awaiting(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("awaiting_setting", None)
     context.user_data.pop("awaiting_channel", None)
     context.user_data.pop("awaiting_api_key", None)
+    context.user_data.pop("awaiting_model", None)
 
 
 async def _delete_message_safely(message) -> None:
@@ -423,6 +427,29 @@ async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text("Каналы:\n" + "\n".join(lines))
 
 
+async def _ping_llm_api() -> tuple[str, Optional[int], Optional[str]]:
+    """Ping LLM API GET /models with the currently active key.
+
+    Returns (emoji, http_status, error_class):
+    emoji — 🟢 ok / 🔴 401, 402 или нет связи / 🟡 прочее;
+    http_status is None for transport errors, error_class holds the
+    exception name in that case.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{settings.llm_base_url}/models",
+                headers={"Authorization": f"Bearer {get_llm_api_key()}"},
+            )
+    except (httpx.TimeoutException, httpx.ConnectError) as exc:
+        return "🔴", None, exc.__class__.__name__
+    if resp.status_code == 200:
+        return "🟢", resp.status_code, None
+    if resp.status_code in (401, 402):
+        return "🔴", resp.status_code, None
+    return "🟡", resp.status_code, None
+
+
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Admin health-check: LLM API, model, realtime, quota cooldown."""
     if not update.effective_user or not _only_admin(update.effective_user.id):
@@ -439,22 +466,16 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         lines.append("🟢 Квота: ок")
 
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{settings.llm_base_url}/models",
-                headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-            )
-        if resp.status_code == 200:
-            lines.append("🟢 LLM API: доступен, ключ действителен")
-        elif resp.status_code == 401:
-            lines.append("🔴 LLM API: ключ недействителен (401)")
-        elif resp.status_code == 402:
-            lines.append("🔴 LLM API: баланс/токены исчерпаны (402)")
-        else:
-            lines.append(f"🟡 LLM API: HTTP {resp.status_code}")
-    except (httpx.TimeoutException, httpx.ConnectError) as exc:
-        lines.append(f"🔴 LLM API: нет связи ({exc.__class__.__name__})")
+    emoji, code, err = await _ping_llm_api()
+    if code is None:
+        lines.append(f"{emoji} LLM API: нет связи ({err})")
+    else:
+        detail = {
+            200: "доступен, ключ действителен",
+            401: "ключ недействителен (401)",
+            402: "баланс/токены исчерпаны (402)",
+        }.get(code, f"HTTP {code}")
+        lines.append(f"{emoji} LLM API: {detail}")
 
     parser = await _get_parser()
     lines.append(
@@ -484,7 +505,10 @@ async def set_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _apply_new_api_key(update, context, " ".join(context.args))
         return
 
+    # Clear other awaiting states — text input must not leak into them.
     if context.user_data is not None:
+        context.user_data.pop("awaiting_setting", None)
+        context.user_data.pop("awaiting_channel", None)
         context.user_data["awaiting_api_key"] = True
     await update.message.reply_text(
         f"Текущий LLM API ключ: {mask_key(current)} ({source})\n\n"
@@ -518,22 +542,18 @@ async def _apply_new_api_key(
         return
     await _delete_message_safely(message)
     await set_setting(LLM_API_KEY_SETTING, key)
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{settings.llm_base_url}/models",
-                headers={"Authorization": f"Bearer {get_llm_api_key()}"},
-            )
-        if resp.status_code == 200:
-            verdict = "🟢 Ключ проверен — LLM API отвечает."
-        elif resp.status_code == 401:
-            verdict = "🔴 Ключ сохранён, но LLM API отклонил его (401). Проверь ключ."
-        elif resp.status_code == 402:
-            verdict = "🟡 Ключ действителен, но баланс исчерпан (402)."
-        else:
-            verdict = f"🟡 Ключ сохранён, LLM API ответил HTTP {resp.status_code}."
-    except (httpx.TimeoutException, httpx.ConnectError):
-        verdict = "🟡 Ключ сохранён, но LLM API сейчас недоступен — проверь позже через /status."
+    emoji, code, err = await _ping_llm_api()
+    if code is None:
+        verdict = (
+            f"{emoji} Ключ сохранён, но LLM API сейчас недоступен ({err}) — "
+            "проверь позже через /status."
+        )
+    else:
+        verdict = {
+            200: f"{emoji} Ключ проверен — LLM API отвечает.",
+            401: f"{emoji} Ключ сохранён, но LLM API отклонил его (401). Проверь ключ.",
+            402: f"{emoji} Ключ действителен, но баланс исчерпан (402).",
+        }.get(code, f"{emoji} Ключ сохранён, LLM API ответил HTTP {code}.")
     if context.user_data is not None:
         context.user_data.pop("awaiting_api_key", None)
     await message.reply_text(
@@ -551,6 +571,102 @@ async def forget_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     masked = set_llm_api_key("")
     await update.message.reply_text(
         f"Ключ из чата удалён. Использую ключ из .env: {masked}"
+    )
+
+
+async def set_model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start the set-model flow: /set_model [id модели]."""
+    if not update.effective_user or not _only_admin(update.effective_user.id):
+        return
+    if not update.message:
+        return
+
+    # Shortcut: /set_model llama-3.3-70b-versatile
+    if context.args:
+        await _apply_new_model(update, context, "".join(context.args))
+        return
+
+    if context.user_data is not None:
+        context.user_data.pop("awaiting_setting", None)
+        context.user_data.pop("awaiting_channel", None)
+        context.user_data["awaiting_model"] = True
+    await update.message.reply_text(
+        f"Текущая модель: {get_llm_model()}\n\n"
+        "Пришли ID модели одним сообщением.\n"
+        "Популярные на Groq (актуальный список: /status или console.groq.com/docs/models):\n"
+        "• llama-3.3-70b-versatile — лучшее качество\n"
+        "• llama-3.1-8b-instant — самая быстрая\n"
+        "• openai/gpt-oss-120b — флагман OpenAI (open-weight)\n"
+        "• openai/gpt-oss-20b — дешёвая и быстрая\n\n"
+        "ID будет проверен по списку моделей Groq перед сохранением.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Отмена", callback_data="back:menu")]]
+        ),
+    )
+
+
+async def _apply_new_model(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, raw_model: str
+) -> None:
+    """Validate the model id against the provider, then save and confirm."""
+    message = update.message
+    model = raw_model.strip()
+    if not model or any(ch.isspace() for ch in model):
+        await message.reply_text(
+            "Некорректный ID модели (пробелы недопустимы). Пришли ещё раз."
+        )
+        return
+
+    # Validate against the provider's model list before saving.
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{settings.llm_base_url}/models",
+                headers={"Authorization": f"Bearer {get_llm_api_key()}"},
+            )
+    except (httpx.TimeoutException, httpx.ConnectError):
+        resp = None
+
+    known_ids: set[str] = set()
+    if resp is not None and resp.status_code == 200:
+        try:
+            known_ids = {
+                m.get("id", "") for m in resp.json().get("data", []) if isinstance(m, dict)
+            }
+        except Exception:
+            logger.warning("Failed to parse models list")
+
+    if resp is None:
+        verdict = "🟡 Модель сохранена, но список моделей сейчас недоступен — проверь позже через /status."
+    elif known_ids and model not in known_ids:
+        await message.reply_text(
+            f"🔴 Модель «{model}» не найдена у провайдера.\n"
+            "Проверь ID: console.groq.com/docs/models\n"
+            "Ничего не сохранено."
+        )
+        return
+    elif known_ids:
+        verdict = f"🟢 Модель проверена — есть в списке провайдера."
+    else:
+        verdict = f"🟡 Модель сохранена, провайдер ответил HTTP {resp.status_code}."
+
+    active = set_llm_model(model)
+    if context.user_data is not None:
+        context.user_data.pop("awaiting_model", None)
+    await set_setting(LLM_MODEL_SETTING, model)
+    await message.reply_text(f"Модель сохранена: {active}\n{verdict}")
+
+
+async def forget_model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Drop the chat-set model and fall back to the one from .env."""
+    if not update.effective_user or not _only_admin(update.effective_user.id):
+        return
+    if not update.message:
+        return
+    await set_setting(LLM_MODEL_SETTING, "")
+    active = set_llm_model("")
+    await update.message.reply_text(
+        f"Модель из чата удалена. Использую модель из .env: {active}"
     )
 
 
@@ -648,6 +764,11 @@ async def settings_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     if user_data.get("awaiting_api_key"):
         context.user_data.pop("awaiting_api_key", None)
         await _apply_new_api_key(update, context, text)
+        return
+
+    if user_data.get("awaiting_model"):
+        context.user_data.pop("awaiting_model", None)
+        await _apply_new_model(update, context, text)
         return
 
     if user_data.get("awaiting_channel"):
@@ -934,14 +1055,18 @@ async def _post_init(application: Application) -> None:
 
     set_notify_callback(_notify_llm_error)
 
-    # Restore a chat-set API key from a previous session, if any.
+    # Restore chat-set API key and model from a previous session, if any.
     try:
         saved_key = await get_setting(LLM_API_KEY_SETTING)
         if (saved_key or "").strip():
             masked = set_llm_api_key(saved_key.strip())
             logger.info("Restored LLM API key from DB (%s)", masked)
+        saved_model = await get_setting(LLM_MODEL_SETTING)
+        if (saved_model or "").strip():
+            set_llm_model(saved_model.strip())
+            logger.info("Restored LLM model from DB: %s", saved_model.strip())
     except Exception:
-        logger.exception("Failed to restore LLM API key from DB")
+        logger.exception("Failed to restore LLM overrides from DB")
 
     try:
         mode = await get_parse_mode()
@@ -986,6 +1111,8 @@ def build_bot() -> None:
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("set_key", set_key_command))
     app.add_handler(CommandHandler("forget_key", forget_key_command))
+    app.add_handler(CommandHandler("set_model", set_model_command))
+    app.add_handler(CommandHandler("forget_model", forget_model_command))
     app.add_handler(CallbackQueryHandler(mode_callback, pattern=r"^mode:"))
     app.add_handler(CallbackQueryHandler(settings_menu, pattern=r"^settings:menu$"))
     app.add_handler(CallbackQueryHandler(settings_toggle_mode, pattern=r"^settings:toggle_mode$"))

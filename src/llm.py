@@ -10,14 +10,28 @@ from src.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Runtime override of the API key, set via chat command.
-# Stored in the DB settings table; survives restarts.
+# Runtime overrides set via chat commands.
+# Stored in the DB settings table; survive restarts.
 _runtime_api_key: Optional[str] = None
+_runtime_model: Optional[str] = None
 
 
 def get_llm_api_key() -> str:
     """Current LLM API key: chat-set override or the one from .env."""
     return _runtime_api_key or settings.llm_api_key
+
+
+def get_llm_model() -> str:
+    """Current LLM model: chat-set override or the one from .env."""
+    return _runtime_model or settings.llm_model
+
+
+def set_llm_model(model: str) -> str:
+    """Apply a model override in memory. Empty string clears it."""
+    global _runtime_model
+    model = (model or "").strip()
+    _runtime_model = model or None
+    return get_llm_model()
 
 
 def set_llm_api_key(key: str) -> str:
@@ -227,7 +241,7 @@ async def judge_vacancy(text: str, filter_rules: dict) -> dict:
         "<<<END_VACANCY_TEXT>>>"
     )
     payload = {
-        "model": settings.llm_model,
+        "model": get_llm_model(),
         "temperature": 0,
         "response_format": {"type": "json_object"},
         "messages": [
@@ -262,7 +276,7 @@ async def generate_response_text(vacancy_text: str) -> str:
         "<<<END_VACANCY_TEXT>>>"
     )
     payload = {
-        "model": settings.llm_model,
+        "model": get_llm_model(),
         "temperature": 0.5,
         "messages": [
             {"role": "system", "content": "Ты опытный фрилансер."},

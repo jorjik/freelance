@@ -12,8 +12,9 @@ class Settings(BaseSettings):
     parser_session_name: str = "freelance_parser"
     database_path: str = "./freelance_parser.db"
     llm_api_key: str
-    llm_base_url: str = "https://api.openai.com/v1"
-    llm_model: str = "gpt-4o-mini"
+    # Groq by default: OpenAI-compatible API, free tier.
+    llm_base_url: str = "https://api.groq.com/openai/v1"
+    llm_model: str = "llama-3.3-70b-versatile"
     log_level: str = "INFO"
 
 

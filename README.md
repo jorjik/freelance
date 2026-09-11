@@ -71,6 +71,8 @@ sudo docker compose up -d --build
 | `/status` | Диагностика: модель LLM, живой пинг LLM API (различает 200 / 401 / 402), состояние квоты, realtime и заполненность фильтра |
 | `/set_key` | Задать LLM API ключ прямо в чате (вариант: `/set_key sk-...`) |
 | `/forget_key` | Удалить ключ из чата и вернуться к ключу из `.env` |
+| `/set_model` | Сменить модель прямо в чате (вариант: `/set_model llama-3.3-70b-versatile`) |
+| `/forget_model` | Вернуться к модели из `.env` |
 
 ## Поведение при ошибках LLM
 
@@ -80,10 +82,31 @@ sudo docker compose up -d --build
 
 Проверить текущее состояние можно командой `/status`.
 
-## Смена API-ключа через чат
+## Провайдер LLM: Groq
 
-Ключ LLM можно поменять без правки `.env` и перезапуска:
+По умолчанию используется **Groq** — OpenAI-совместимый API с бесплатным тарифом:
 
+- `LLM_BASE_URL` = `https://api.groq.com/openai/v1`
+- `LLM_MODEL` = `llama-3.3-70b-versatile`
+
+Ключ берётся в [console.groq.com](https://console.groq.com/keys) (`GROQ_API_KEY` → `LLM_API_KEY` в `.env`). Актуальный список моделей: `GET /models` или [console.groq.com/docs/models](https://console.groq.com/docs/models).
+
+Популярные модели:
+
+| ID | Особенность |
+|---|---|
+| `llama-3.3-70b-versatile` | Лучшее качество (дефолт) |
+| `llama-3.1-8b-instant` | Самая быстрая |
+| `openai/gpt-oss-120b` | Флагман OpenAI (open-weight) |
+| `openai/gpt-oss-20b` | Дешёвая и быстрая |
+
+Любой OpenAI-совместимый провайдер можно подключить, задав свой `LLM_BASE_URL`.
+
+## Смена API-ключа и модели через чат
+
+Ключ и модель можно менять без правки `.env` и перезапуска:
+
+**Ключ:**
 1. `/set_key` — бот спросит ключ (или сразу: `/set_key sk-...`).
 2. Пришли ключ одним сообщением — бот **удалит твоё сообщение с ключом** и проверит ключ живым запросом к API (🟢 200 / 🔴 401 / 🟡 402).
 3. Ключ сохраняется в базе и **переживает перезапуск** бота.
@@ -91,6 +114,12 @@ sudo docker compose up -d --build
 Откатить: `/forget_key` — вернуться к ключу из `.env`.
 
 ⚠️ Сообщение с ключом на секунду видно в чате до удаления — для максимальной безопасности задавай ключ в `.env`.
+
+**Модель:**
+1. `/set_model` — бот покажет популярные модели Groq (или сразу: `/set_model llama-3.1-8b-instant`).
+2. ID проверяется по списку моделей провайдера — несуществующая модель не сохранится.
+
+Откатить: `/forget_model` — вернуться к модели из `.env`.
 
 ## Переменные окружения
 
@@ -100,8 +129,8 @@ sudo docker compose up -d --build
 
 | Переменная | По умолчанию | Описание |
 |---|---|---|
-| `LLM_BASE_URL` | `https://api.openai.com/v1` | База OpenAI-совместимого API |
-| `LLM_MODEL` | `gpt-4o-mini` | Модель для фильтрации и откликов |
+| `LLM_BASE_URL` | `https://api.groq.com/openai/v1` | База OpenAI-совместимого API |
+| `LLM_MODEL` | `llama-3.3-70b-versatile` | Модель для фильтрации и откликов |
 | `LOG_LEVEL` | `INFO` | Уровень логирования (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 | `DATABASE_PATH` | `./freelance_parser.db` | Путь к файлу базы |
 | `PARSER_SESSION_NAME` | `freelance_parser` | Имя Telethon-сессии |
@@ -113,4 +142,4 @@ pip install -e ".[dev]"   # ставит pytest и pytest-asyncio
 python -m pytest tests/ -v
 ```
 
-62 теста покрывают: валидацию входа каналов (`parse_channel_input`), retry-логику с бэкоффом (замоканный HTTP — без сети), кулдаун при 402, парсинг ответов LLM и смену API-ключа через чат.
+69 тестов покрывают: валидацию входа каналов (`parse_channel_input`), retry-логику с бэкоффом (замоканный HTTP — без сети), кулдаун при 402, пинг API, парсинг ответов LLM и смену ключа/модели через чат.

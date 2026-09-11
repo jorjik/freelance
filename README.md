@@ -87,7 +87,7 @@ sudo docker compose up -d --build
 По умолчанию используется **Groq** — OpenAI-совместимый API с бесплатным тарифом:
 
 - `LLM_BASE_URL` = `https://api.groq.com/openai/v1`
-- `LLM_MODEL` = `llama-3.3-70b-versatile`
+- `LLM_MODEL` = `openai/gpt-oss-120b` (проверено на бесплатном тарифе; Llama-модели на Groq теперь доступны только Enterprise-плану)
 
 Ключ берётся в [console.groq.com](https://console.groq.com/keys) (`GROQ_API_KEY` → `LLM_API_KEY` в `.env`). Актуальный список моделей: `GET /models` или [console.groq.com/docs/models](https://console.groq.com/docs/models).
 
@@ -95,10 +95,10 @@ sudo docker compose up -d --build
 
 | ID | Особенность |
 |---|---|
-| `llama-3.3-70b-versatile` | Лучшее качество (дефолт) |
-| `llama-3.1-8b-instant` | Самая быстрая |
-| `openai/gpt-oss-120b` | Флагман OpenAI (open-weight) |
-| `openai/gpt-oss-20b` | Дешёвая и быстрая |
+| `openai/gpt-oss-120b` | Лучшее качество (дефолт) |
+| `openai/gpt-oss-20b` | Самая дешёвая и быстрая |
+| `qwen/qwen3.6-27b` | Альтернатива от Qwen |
+| `groq/compound` | Агентная система с веб-поиском |
 
 Любой OpenAI-совместимый провайдер можно подключить, задав свой `LLM_BASE_URL`.
 
@@ -116,7 +116,7 @@ sudo docker compose up -d --build
 ⚠️ Сообщение с ключом на секунду видно в чате до удаления — для максимальной безопасности задавай ключ в `.env`.
 
 **Модель:**
-1. `/set_model` — бот покажет популярные модели Groq (или сразу: `/set_model llama-3.1-8b-instant`).
+1. `/set_model` — бот покажет популярные модели Groq (или сразу: `/set_model openai/gpt-oss-20b`).
 2. ID проверяется по списку моделей провайдера — несуществующая модель не сохранится.
 
 Откатить: `/forget_model` — вернуться к модели из `.env`.
@@ -130,7 +130,7 @@ sudo docker compose up -d --build
 | Переменная | По умолчанию | Описание |
 |---|---|---|
 | `LLM_BASE_URL` | `https://api.groq.com/openai/v1` | База OpenAI-совместимого API |
-| `LLM_MODEL` | `llama-3.3-70b-versatile` | Модель для фильтрации и откликов |
+| `LLM_MODEL` | `openai/gpt-oss-120b` | Модель для фильтрации и откликов |
 | `LOG_LEVEL` | `INFO` | Уровень логирования (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 | `DATABASE_PATH` | `./freelance_parser.db` | Путь к файлу базы |
 | `PARSER_SESSION_NAME` | `freelance_parser` | Имя Telethon-сессии |

@@ -594,10 +594,10 @@ async def set_model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"Текущая модель: {get_llm_model()}\n\n"
         "Пришли ID модели одним сообщением.\n"
         "Популярные на Groq (актуальный список: /status или console.groq.com/docs/models):\n"
-        "• llama-3.3-70b-versatile — лучшее качество\n"
-        "• llama-3.1-8b-instant — самая быстрая\n"
-        "• openai/gpt-oss-120b — флагман OpenAI (open-weight)\n"
-        "• openai/gpt-oss-20b — дешёвая и быстрая\n\n"
+        "• openai/gpt-oss-120b — лучшее качество (дефолт)\n"
+        "• openai/gpt-oss-20b — дешёвая и быстрая\n"
+        "• qwen/qwen3.6-27b — альтернатива от Qwen\n"
+        "• groq/compound — агентная система с веб-поиском\n\n"
         "ID будет проверен по списку моделей Groq перед сохранением.",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("Отмена", callback_data="back:menu")]]

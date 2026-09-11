@@ -14,7 +14,8 @@ class Settings(BaseSettings):
     llm_api_key: str
     # Groq by default: OpenAI-compatible API, free tier.
     llm_base_url: str = "https://api.groq.com/openai/v1"
-    llm_model: str = "llama-3.3-70b-versatile"
+    # Verified working on Groq's free tier (llama models are Enterprise now).
+    llm_model: str = "openai/gpt-oss-120b"
     log_level: str = "INFO"
 
 

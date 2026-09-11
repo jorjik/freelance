@@ -17,7 +17,12 @@ from src.db import (
     get_channels,
     get_vacancy_decision,
 )
-from src.llm import judge_vacancy, normalize_decision, notify_llm_error
+from src.llm import (
+    QuotaPausedError,
+    judge_vacancy,
+    normalize_decision,
+    notify_llm_error,
+)
 from src.models import AIDecision
 
 logger = logging.getLogger(__name__)
@@ -113,9 +118,15 @@ class Parser:
             ai = await judge_vacancy(msg_text, filter_rules)
             decision = AIDecision(normalize_decision(ai["decision"]))
             await update_vacancy_ai(vacancy_id, decision.value, ai.get("reason", ""))
+        except QuotaPausedError as exc:
+            logger.info("AI filtering skipped (quota cooldown): %s", exc)
+            return None
         except Exception as exc:
             logger.warning("AI filtering failed: %s", exc)
-            await notify_llm_error(exc, context=f"Фильтрация поста {username}/{message_id} пропущена")
+            await notify_llm_error(
+                exc,
+                context=f"Фильтрация поста {username}/{message_id} пропущена",
+            )
             return None
         if decision != AIDecision.ACCEPT:
             return None

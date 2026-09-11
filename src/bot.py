@@ -3,6 +3,8 @@ import logging
 import re
 from typing import Optional
 
+import httpx
+
 from telegram import (
     Update,
     InlineKeyboardMarkup,
@@ -40,14 +42,21 @@ from src.db import (
     PARSE_MODE_REALTIME,
     PARSE_MODE_BATCH,
 )
-from src.llm import generate_response_text, set_notify_callback
+
+from src.llm import (
+    QuotaPausedError,
+    generate_response_text,
+    is_quota_paused,
+    quota_cooldown_remaining,
+    set_notify_callback,
+)
 from src.parser import Parser
 
 
 logger = logging.getLogger(__name__)
 _parser: Optional[Parser] = None
 _app: Optional[Application] = None
-_batch_running = False
+_batch_lock = asyncio.Lock()
 COPY_TEXT_MAX = 256
 
 CHANNEL_LINK_RE = re.compile(
@@ -397,6 +406,53 @@ async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text("Каналы:\n" + "\n".join(lines))
 
 
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin health-check: LLM API, model, realtime, quota cooldown."""
+    if not update.effective_user or not _only_admin(update.effective_user.id):
+        return
+    if not update.message:
+        return
+    lines = [f"Модель LLM: {settings.llm_model}"]
+
+    if is_quota_paused():
+        remaining = int(quota_cooldown_remaining())
+        lines.append(
+            f"🔴 Квота: исчерпана, фильтрация на паузе ещё {remaining // 60} мин {remaining % 60} с"
+        )
+    else:
+        lines.append("🟢 Квота: ок")
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{settings.llm_base_url}/models",
+                headers={"Authorization": f"Bearer {settings.llm_api_key}"},
+            )
+        if resp.status_code == 200:
+            lines.append("🟢 LLM API: доступен, ключ действителен")
+        elif resp.status_code == 401:
+            lines.append("🔴 LLM API: ключ недействителен (401)")
+        elif resp.status_code == 402:
+            lines.append("🔴 LLM API: баланс/токены исчерпаны (402)")
+        else:
+            lines.append(f"🟡 LLM API: HTTP {resp.status_code}")
+    except (httpx.TimeoutException, httpx.ConnectError) as exc:
+        lines.append(f"🔴 LLM API: нет связи ({exc.__class__.__name__})")
+
+    parser = await _get_parser()
+    lines.append(
+        "🟢 Realtime: слушает " + ", ".join(parser.watch_usernames)
+        if parser.is_listening
+        else "⚪️ Realtime: остановлен"
+    )
+    lines.append(
+        "🟢 Фильтр ИИ: заполнен"
+        if await are_filter_settings_complete()
+        else "🔴 Фильтр ИИ: не заполнен"
+    )
+    await update.message.reply_text("Статус\n" + "\n".join(lines))
+
+
 async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not query.from_user or not _only_admin(query.from_user.id):
@@ -601,7 +657,6 @@ async def channel_limit_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def _run_batch_job(message, username: str, limit: int) -> None:
-    global _batch_running
     try:
         parser = await _get_parser()
         result = await parser.parse_channel(username, limit=limit)
@@ -626,11 +681,10 @@ async def _run_batch_job(message, username: str, limit: int) -> None:
         logger.exception("Parser failed")
         await message.reply_text(f"Ошибка: {exc}")
     finally:
-        _batch_running = False
+        _batch_lock.release()
 
 
 async def run_parser_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global _batch_running
     query = update.callback_query
     if not query or not query.from_user or not _only_admin(query.from_user.id):
         return
@@ -643,7 +697,7 @@ async def run_parser_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             ),
         )
         return
-    if _batch_running:
+    if _batch_lock.locked():
         await query.message.reply_text("Разовый парсинг уже идёт. Дождись завершения.")
         return
     parts = query.data.split(":")
@@ -661,7 +715,7 @@ async def run_parser_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not username:
         await query.message.reply_text("У канала нет username")
         return
-    _batch_running = True
+    await _batch_lock.acquire()
     await query.message.reply_text(f"Парсим {username}, последние {limit} сообщений ...")
     asyncio.create_task(_run_batch_job(query.message, username, limit))
 
@@ -699,7 +753,13 @@ async def list_accepted_vacancies(update: Update, context: ContextTypes.DEFAULT_
         if not vacancy or vacancy.get("ai_decision") != "ACCEPT":
             await query.message.reply_text("Вакансия не найдена")
             return
-        reply_text = await generate_response_text(vacancy["text"])
+        try:
+            reply_text = await generate_response_text(vacancy["text"])
+        except QuotaPausedError:
+            await query.message.reply_text(
+                "Баланс LLM исчерпан, генерация откликов на паузе. Попробуй позже."
+            )
+            return
         await add_response(vacancy_id, query.from_user.id, reply_text)
         # Plain message = easy long-press copy for any length.
         await query.message.reply_text(reply_text)
@@ -808,6 +868,7 @@ def build_bot() -> None:
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("add_channel", add_channel_command))
     app.add_handler(CommandHandler("channels", channels_command))
+    app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CallbackQueryHandler(mode_callback, pattern=r"^mode:"))
     app.add_handler(CallbackQueryHandler(settings_menu, pattern=r"^settings:menu$"))
     app.add_handler(CallbackQueryHandler(settings_toggle_mode, pattern=r"^settings:toggle_mode$"))
@@ -825,7 +886,7 @@ def build_bot() -> None:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=settings.log_level.upper())
     build_bot()
 
 

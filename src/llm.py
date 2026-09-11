@@ -19,14 +19,29 @@ _consecutive_failures = 0
 _last_failure_notify = 0.0
 FAILURE_NOTIFY_INTERVAL = 300  # Notify at most once per 5 minutes
 
+# Cooldown after a 402 (quota exhausted): stop calling the LLM entirely
+QUOTA_COOLDOWN_SECONDS = 600  # 10 minutes
+_quota_cooldown_until = 0.0
 
-async def _notify_admin(message: str) -> None:
+
+def is_quota_paused() -> bool:
+    """True while the LLM is skipped due to a recent quota-exhaustion error."""
+    return time.time() < _quota_cooldown_until
+
+
+def quota_cooldown_remaining() -> float:
+    """Seconds left of the quota cooldown (0 if not cooling down)."""
+    remaining = _quota_cooldown_until - time.time()
+    return max(0.0, remaining)
+
+
+async def _notify_admin(message: str, force: bool = False) -> None:
     """Send notification to admin if callback is registered."""
     global _consecutive_failures, _last_failure_notify
     if _notify_callback is None:
         return
     now = time.time()
-    if now - _last_failure_notify < FAILURE_NOTIFY_INTERVAL:
+    if not force and now - _last_failure_notify < FAILURE_NOTIFY_INTERVAL:
         return
     _last_failure_notify = now
     try:
@@ -43,22 +58,44 @@ def set_notify_callback(callback: Callable) -> None:
 
 def _format_llm_error(exc: BaseException) -> str:
     """Human-readable description of an LLM API error."""
-    status = getattr(getattr(exc, "response", None), "status_code", None)
-    if status == 402:
-        return "402 Payment Required — баланс/токены LLM исчерпаны, пополни аккаунт"
-    if status == 401:
-        return "401 Unauthorized — проверь LLM API ключ"
-    if status is not None:
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status == 402:
+            return "402 Payment Required — баланс/токены LLM исчерпаны, пополни аккаунт"
+        if status == 401:
+            return "401 Unauthorized — проверь LLM API ключ"
         return f"HTTP {status}: {exc}"
     return str(exc) or exc.__class__.__name__
 
 
+def _is_quota_error(exc: BaseException) -> bool:
+    """True when the exception means the LLM balance/quota is exhausted."""
+    return (
+        isinstance(exc, httpx.HTTPStatusError)
+        and exc.response.status_code == 402
+    )
+
+
 async def notify_llm_error(exc: BaseException, context: str = "") -> None:
     """Notify admin about an LLM failure (throttled to once per 5 min)."""
+    global _quota_cooldown_until
+    if _is_quota_error(exc):
+        # Quota exhaustion is urgent: bypass the 5-minute throttle,
+        # arm the cooldown and notify only on the first 402 of a burst.
+        was_paused = is_quota_paused()
+        _quota_cooldown_until = time.time() + QUOTA_COOLDOWN_SECONDS
+        if not was_paused:
+            await _notify_admin(
+                "🔴 Баланс/токены LLM исчерпаны (402).\n"
+                f"Фильтрация приостановлена на {QUOTA_COOLDOWN_SECONDS // 60} мин.",
+                force=True,
+            )
+        return
     message = f"⚠️ Ошибка LLM API: {_format_llm_error(exc)}"
     if context:
         message += f"\nКонтекст: {context}"
     await _notify_admin(message)
+
 
 SYSTEM_PROMPT = (
     "Ты фильтруешь фриланс-вакансии строго по критериям пользователя. "
@@ -68,6 +105,10 @@ SYSTEM_PROMPT = (
 )
 
 ALLOWED_DECISIONS = {"ACCEPT", "REJECT", "REVIEW"}
+
+
+class QuotaPausedError(RuntimeError):
+    """Raised when the LLM is skipped because the quota cooldown is active."""
 
 
 def _format_filter_rules(filter_rules: dict) -> str:
@@ -112,12 +153,14 @@ async def _call_llm_with_retry(payload: dict, max_retries: int = 3) -> dict:
             # Don't retry on client errors (except 429 rate limit)
             if 400 <= status < 500 and status != 429:
                 logger.warning(f"LLM API client error {status}: {e}")
-                _consecutive_failures += 1
-                if _consecutive_failures >= 3:
-                    await _notify_admin(
-                        f"⚠️ LLM API ошибка {status} (повторяется).\n"
-                        f"Проверь API ключ и баланс."
-                    )
+                if _is_quota_error(e):
+                    await notify_llm_error(e)
+                else:
+                    _consecutive_failures += 1
+                    if _consecutive_failures >= 3:
+                        await _notify_admin(
+                            f"⚠️ LLM API ошибка: {_format_llm_error(e)} (повторяется)."
+                        )
                 raise
             # Retry on 429, 500, 502, 503, 504
         except (httpx.TimeoutException, httpx.ConnectError) as e:
@@ -135,12 +178,17 @@ async def _call_llm_with_retry(payload: dict, max_retries: int = 3) -> dict:
     if _consecutive_failures >= 3:
         await _notify_admin(
             f"🔴 LLM API недоступен после {max_retries + 1} попыток.\n"
-            f"Последняя ошибка: {last_error}"
+            f"Последняя ошибка: {_format_llm_error(last_error) if last_error else 'неизвестно'}"
         )
     raise last_error
 
 
 async def judge_vacancy(text: str, filter_rules: dict) -> dict:
+    if is_quota_paused():
+        remaining = int(quota_cooldown_remaining())
+        raise QuotaPausedError(
+            f"Фильтрация приостановлена: квота LLM исчерпана, осталось {remaining // 60} мин {remaining % 60} с"
+        )
     prompt = (
         "Оцени вакансию ТОЛЬКО по критериям ниже.\n"
         "decision=ACCEPT только если вакансия явно подходит.\n"

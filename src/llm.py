@@ -40,6 +40,26 @@ def set_notify_callback(callback: Callable) -> None:
     global _notify_callback
     _notify_callback = callback
 
+
+def _format_llm_error(exc: BaseException) -> str:
+    """Human-readable description of an LLM API error."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status == 402:
+        return "402 Payment Required — баланс/токены LLM исчерпаны, пополни аккаунт"
+    if status == 401:
+        return "401 Unauthorized — проверь LLM API ключ"
+    if status is not None:
+        return f"HTTP {status}: {exc}"
+    return str(exc) or exc.__class__.__name__
+
+
+async def notify_llm_error(exc: BaseException, context: str = "") -> None:
+    """Notify admin about an LLM failure (throttled to once per 5 min)."""
+    message = f"⚠️ Ошибка LLM API: {_format_llm_error(exc)}"
+    if context:
+        message += f"\nКонтекст: {context}"
+    await _notify_admin(message)
+
 SYSTEM_PROMPT = (
     "Ты фильтруешь фриланс-вакансии строго по критериям пользователя. "
     "Не добавляй собственных предпочтений. "

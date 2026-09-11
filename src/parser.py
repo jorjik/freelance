@@ -17,7 +17,7 @@ from src.db import (
     get_channels,
     get_vacancy_decision,
 )
-from src.llm import judge_vacancy, normalize_decision
+from src.llm import judge_vacancy, normalize_decision, notify_llm_error
 from src.models import AIDecision
 
 logger = logging.getLogger(__name__)
@@ -115,6 +115,7 @@ class Parser:
             await update_vacancy_ai(vacancy_id, decision.value, ai.get("reason", ""))
         except Exception as exc:
             logger.warning("AI filtering failed: %s", exc)
+            await notify_llm_error(exc, context=f"Фильтрация поста {username}/{message_id} пропущена")
             return None
         if decision != AIDecision.ACCEPT:
             return None

@@ -1,13 +1,36 @@
-.git
+# Secrets
 .env
 .env.*
-__pycache__
+
+# Session files
+*.session
+*.session-journal
+sessions/
+
+# Database
+*.db
+*.db-*
+
+# Python artifacts
+__pycache__/
 *.pyc
 *.pyo
-.venv
-venv
-*.db
-*.sqlite
-chunks/
-_freebuff/
+*.egg-info/
+.venv/
+venv/
+
+# Git
+.git/
 .gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime data
+downloads/
+_chunks/

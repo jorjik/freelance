@@ -10,6 +10,32 @@ from src.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Runtime override of the API key, set via chat command.
+# Stored in the DB settings table; survives restarts.
+_runtime_api_key: Optional[str] = None
+
+
+def get_llm_api_key() -> str:
+    """Current LLM API key: chat-set override or the one from .env."""
+    return _runtime_api_key or settings.llm_api_key
+
+
+def set_llm_api_key(key: str) -> str:
+    """Apply a new API key in memory. Empty string clears the override."""
+    global _runtime_api_key
+    key = (key or "").strip()
+    _runtime_api_key = key or None
+    # Reset failure counters and quota cooldown — the old key's errors
+    # are no longer relevant.
+    global _consecutive_failures, _quota_cooldown_until
+    _consecutive_failures = 0
+    _quota_cooldown_until = 0.0
+    return mask_key(key or get_llm_api_key())
+
+
+def mask_key(key: str) -> str:
+    return f"...{key[-4:]}" if len(key) > 8 else "***"
+
 # Notification callback: called when API fails after retries
 # Signature: async def notify(message: str) -> None
 _notify_callback: Optional[Callable] = None
@@ -139,7 +165,7 @@ async def _call_llm_with_retry(payload: dict, max_retries: int = 3) -> dict:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(
                     f"{settings.llm_base_url}/chat/completions",
-                    headers={"Authorization": f"Bearer {settings.llm_api_key}"},
+                    headers={"Authorization": f"Bearer {get_llm_api_key()}"},
                     json=payload,
                 )
                 resp.raise_for_status()

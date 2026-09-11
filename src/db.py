@@ -136,6 +136,16 @@ async def get_filter_settings() -> dict[str, str]:
     return result
 
 
+LLM_API_KEY_SETTING = "llm_api_key"
+
+
+async def get_llm_api_key() -> Optional[str]:
+    """API key set via chat (overrides the .env one). None if not set."""
+    value = await get_setting(LLM_API_KEY_SETTING)
+    value = (value or "").strip()
+    return value or None
+
+
 async def get_parse_mode() -> str:
     value = (await get_setting(PARSE_MODE_KEY) or "").strip().lower()
     if value in (PARSE_MODE_REALTIME, PARSE_MODE_BATCH):

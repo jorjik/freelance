@@ -6,6 +6,7 @@ from typing import Optional
 import httpx
 
 from telegram import (
+    error as tg_error,
     Update,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
@@ -34,9 +35,11 @@ from src.db import (
     get_channels,
     add_channel,
     get_filter_settings,
+    get_setting,
     set_setting,
     are_filter_settings_complete,
     FILTER_KEYS,
+    LLM_API_KEY_SETTING,
     get_parse_mode,
     set_parse_mode,
     PARSE_MODE_REALTIME,
@@ -46,8 +49,11 @@ from src.db import (
 from src.llm import (
     QuotaPausedError,
     generate_response_text,
+    get_llm_api_key,
     is_quota_paused,
+    mask_key,
     quota_cooldown_remaining,
+    set_llm_api_key,
     set_notify_callback,
 )
 from src.parser import Parser
@@ -82,6 +88,17 @@ def _clear_awaiting(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     context.user_data.pop("awaiting_setting", None)
     context.user_data.pop("awaiting_channel", None)
+    context.user_data.pop("awaiting_api_key", None)
+
+
+async def _delete_message_safely(message) -> None:
+    """Best-effort delete: the key must not stay visible in the chat."""
+    try:
+        await message.delete()
+    except tg_error.BadRequest:
+        pass
+    except Exception:
+        logger.exception("Failed to delete message with API key")
 
 
 def parse_channel_input(raw: str) -> str:
@@ -453,6 +470,90 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text("Статус\n" + "\n".join(lines))
 
 
+async def set_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start the set-API-key flow: /set_key [ключ]."""
+    if not update.effective_user or not _only_admin(update.effective_user.id):
+        return
+    if not update.message:
+        return
+    current = get_llm_api_key()
+    source = "из .env" if current == settings.llm_api_key else "задан через чат"
+
+    # Shortcut: /set_key sk-... — key passed inline.
+    if context.args:
+        await _apply_new_api_key(update, context, " ".join(context.args))
+        return
+
+    if context.user_data is not None:
+        context.user_data["awaiting_api_key"] = True
+    await update.message.reply_text(
+        f"Текущий LLM API ключ: {mask_key(current)} ({source})\n\n"
+        "Пришли новый ключ одним сообщением.\n"
+        "⚠️ Я удалю твоё сообщение с ключом сразу после сохранения, "
+        "но учти: оно на секунду появится в чате и попадёт в историю «до удаления».\n\n"
+        "Безопаснее задать ключ в .env и перезапустить бота.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Отмена", callback_data="back:menu")]]
+        ),
+    )
+
+
+async def _apply_new_api_key(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, raw_key: str
+) -> None:
+    """Validate, save and confirm the new API key; delete the key message."""
+    message = update.message
+    key = raw_key.strip()
+    # Basic sanity: OpenAI-style keys are 20+ chars, no spaces.
+    if len(key) < 20 or any(ch.isspace() for ch in key):
+        await message.reply_text(
+            "Ключ слишком короткий или содержит пробелы. Проверь и пришли ещё раз. "
+            "(/set_key для отмены не нужна — просто /start)"
+        )
+        return
+    try:
+        masked = set_llm_api_key(key)
+    except ValueError as exc:
+        await message.reply_text(f"Не сохранено: {exc}")
+        return
+    await _delete_message_safely(message)
+    await set_setting(LLM_API_KEY_SETTING, key)
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{settings.llm_base_url}/models",
+                headers={"Authorization": f"Bearer {get_llm_api_key()}"},
+            )
+        if resp.status_code == 200:
+            verdict = "🟢 Ключ проверен — LLM API отвечает."
+        elif resp.status_code == 401:
+            verdict = "🔴 Ключ сохранён, но LLM API отклонил его (401). Проверь ключ."
+        elif resp.status_code == 402:
+            verdict = "🟡 Ключ действителен, но баланс исчерпан (402)."
+        else:
+            verdict = f"🟡 Ключ сохранён, LLM API ответил HTTP {resp.status_code}."
+    except (httpx.TimeoutException, httpx.ConnectError):
+        verdict = "🟡 Ключ сохранён, но LLM API сейчас недоступен — проверь позже через /status."
+    if context.user_data is not None:
+        context.user_data.pop("awaiting_api_key", None)
+    await message.reply_text(
+        f"Новый LLM API ключ сохранён: {masked}\n{verdict}"
+    )
+
+
+async def forget_key_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Drop the chat-set key and fall back to the one from .env."""
+    if not update.effective_user or not _only_admin(update.effective_user.id):
+        return
+    if not update.message:
+        return
+    await set_setting(LLM_API_KEY_SETTING, "")
+    masked = set_llm_api_key("")
+    await update.message.reply_text(
+        f"Ключ из чата удалён. Использую ключ из .env: {masked}"
+    )
+
+
 async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not query.from_user or not _only_admin(query.from_user.id):
@@ -542,6 +643,11 @@ async def settings_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             await _open_parser(update.message)
         else:
             await _open_settings(update.message)
+        return
+
+    if user_data.get("awaiting_api_key"):
+        context.user_data.pop("awaiting_api_key", None)
+        await _apply_new_api_key(update, context, text)
         return
 
     if user_data.get("awaiting_channel"):
@@ -828,6 +934,15 @@ async def _post_init(application: Application) -> None:
 
     set_notify_callback(_notify_llm_error)
 
+    # Restore a chat-set API key from a previous session, if any.
+    try:
+        saved_key = await get_setting(LLM_API_KEY_SETTING)
+        if (saved_key or "").strip():
+            masked = set_llm_api_key(saved_key.strip())
+            logger.info("Restored LLM API key from DB (%s)", masked)
+    except Exception:
+        logger.exception("Failed to restore LLM API key from DB")
+
     try:
         mode = await get_parse_mode()
         if mode == PARSE_MODE_REALTIME:
@@ -869,6 +984,8 @@ def build_bot() -> None:
     app.add_handler(CommandHandler("add_channel", add_channel_command))
     app.add_handler(CommandHandler("channels", channels_command))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("set_key", set_key_command))
+    app.add_handler(CommandHandler("forget_key", forget_key_command))
     app.add_handler(CallbackQueryHandler(mode_callback, pattern=r"^mode:"))
     app.add_handler(CallbackQueryHandler(settings_menu, pattern=r"^settings:menu$"))
     app.add_handler(CallbackQueryHandler(settings_toggle_mode, pattern=r"^settings:toggle_mode$"))

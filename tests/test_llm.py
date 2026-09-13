@@ -79,6 +79,17 @@ class TestFormatLlmError:
         text = _format_llm_error(_http_status_error(500))
         assert "HTTP 500" in text
 
+    def test_read_error_is_network_error(self):
+        # Регрессия: ReadError раньше попадал в общий str(exc) — админу
+        # уходило непонятное «Ошибка LLM API: ReadError».
+        text = _format_llm_error(httpx.ReadError("connection dropped"))
+        assert "сетевая ошибка" in text
+        assert "ReadError" in text
+
+    def test_timeout_message(self):
+        text = _format_llm_error(httpx.ReadTimeout("too slow"))
+        assert "таймаут" in text
+
     def test_non_http_exception(self):
         assert "boom" in _format_llm_error(ValueError("boom"))
         assert _format_llm_error(ValueError()) == "ValueError"
@@ -171,6 +182,34 @@ class TestCallLlmWithRetry:
         assert result == {"ok": True}
         assert post.await_count == 2
         sleep_mock.assert_awaited()
+
+    async def test_retries_on_read_error_then_succeeds(self):
+        # Регрессия: обрыв соединения при чтении ответа (ReadError) раньше
+        # не ловился ретрай-логикой и срывал фильтрацию поста.
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.json.return_value = {"ok": True}
+        post = AsyncMock(side_effect=[httpx.ReadError("connection dropped"), ok])
+        with patch("src.llm.httpx.AsyncClient") as client_cls, patch(
+            "src.llm.asyncio.sleep", new=AsyncMock()
+        ) as sleep_mock:
+            client_cls.return_value.__aenter__ = AsyncMock(return_value=MagicMock(post=post))
+            client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            result = await _call_llm_with_retry({"messages": []})
+        assert result == {"ok": True}
+        assert post.await_count == 2
+        sleep_mock.assert_awaited()
+
+    async def test_exhausts_retries_on_read_error(self):
+        post = AsyncMock(side_effect=httpx.ReadError("connection dropped"))
+        with patch("src.llm.httpx.AsyncClient") as client_cls, patch(
+            "src.llm.asyncio.sleep", new=AsyncMock()
+        ):
+            client_cls.return_value.__aenter__ = AsyncMock(return_value=MagicMock(post=post))
+            client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            with pytest.raises(httpx.ReadError):
+                await _call_llm_with_retry({"messages": []}, max_retries=2)
+        assert post.await_count == 3  # 1 + 2 retries
 
     async def test_exhausts_retries_on_500(self):
         post = AsyncMock(side_effect=_http_status_error(500))

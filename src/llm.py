@@ -105,6 +105,11 @@ def _format_llm_error(exc: BaseException) -> str:
         if status == 401:
             return "401 Unauthorized — проверь LLM API ключ"
         return f"HTTP {status}: {exc}"
+    # Порядок важен: TimeoutException — подкласс TransportError.
+    if isinstance(exc, httpx.TimeoutException):
+        return "таймаут запроса к LLM API"
+    if isinstance(exc, httpx.TransportError):
+        return f"сетевая ошибка ({exc.__class__.__name__})"
     return str(exc) or exc.__class__.__name__
 
 
@@ -203,9 +208,12 @@ async def _call_llm_with_retry(payload: dict, max_retries: int = 3) -> dict:
                         )
                 raise
             # Retry on 429, 500, 502, 503, 504
-        except (httpx.TimeoutException, httpx.ConnectError) as e:
+        except httpx.TransportError as e:
+            # TransportError покрывает и обрывы соединения (ReadError),
+            # и таймауты — раньше ловились только два подкласса, ReadError
+            # пролетал без ретраев и срывал фильтрацию поста.
             last_error = e
-            logger.warning(f"LLM API connection error: {e}")
+            logger.warning(f"LLM API network error: {e}")
 
         # Exponential backoff: 1s, 2s, 4s...
         if attempt < max_retries:

@@ -441,7 +441,9 @@ async def _ping_llm_api() -> tuple[str, Optional[int], Optional[str]]:
                 f"{settings.llm_base_url}/models",
                 headers={"Authorization": f"Bearer {get_llm_api_key()}"},
             )
-    except (httpx.TimeoutException, httpx.ConnectError) as exc:
+    # TransportError шире, чем пара Timeout/Connect: туда же попадает
+    # ReadError (обрыв соединения при чтении ответа).
+    except httpx.TransportError as exc:
         return "🔴", None, exc.__class__.__name__
     if resp.status_code == 200:
         return "🟢", resp.status_code, None
@@ -624,7 +626,7 @@ async def _apply_new_model(
                 f"{settings.llm_base_url}/models",
                 headers={"Authorization": f"Bearer {get_llm_api_key()}"},
             )
-    except (httpx.TimeoutException, httpx.ConnectError):
+    except httpx.TransportError:
         resp = None
 
     known_ids: set[str] = set()

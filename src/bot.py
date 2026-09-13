@@ -370,6 +370,21 @@ async def _open_settings(message) -> None:
     )
 
 
+HELP_TEXT = (
+    "Справка по командам\n"
+    "\n"
+    "/start — главное меню\n"
+    "/help — эта справка\n"
+    "/add_channel [@username] — добавить канал (сразу или после запроса)\n"
+    "/channels — список каналов в базе\n"
+    "/status — диагностика: модель LLM, пинг API, квота, realtime, фильтр\n"
+    "/set_key — задать LLM API ключ через чат (или сразу: /set_key sk-...)\n"
+    "/forget_key — вернуться к ключу из .env\n"
+    "/set_model — сменить модель LLM (или сразу: /set_model openai/gpt-oss-20b)\n"
+    "/forget_model — вернуться к модели из .env"
+)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not _only_admin(update.effective_user.id):
         return
@@ -378,9 +393,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if target is None:
         return
     await target.reply_text(
-        "Freelance parser\nВыбери действие в меню внизу.",
+        f"Freelance parser\nВыбери действие в меню внизу.\n\n{HELP_TEXT}",
         reply_markup=_main_keyboard(),
     )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reference for all commands — same text /start prints at startup."""
+    if not update.effective_user or not _only_admin(update.effective_user.id):
+        return
+    if not update.message:
+        return
+    await update.message.reply_text(HELP_TEXT)
 
 
 async def add_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1107,7 +1131,7 @@ def build_bot() -> None:
         .build()
     )
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("add_channel", add_channel_command))
     app.add_handler(CommandHandler("channels", channels_command))
     app.add_handler(CommandHandler("status", status_command))

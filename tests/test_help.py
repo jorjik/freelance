@@ -14,7 +14,14 @@ os.environ.setdefault("LLM_API_KEY", "test-key")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.bot import HELP_TEXT, help_command, start
+from src.bot import (
+    HELP_TEXT,
+    MENU_HELP,
+    _main_keyboard,
+    help_command,
+    settings_text_input,
+    start,
+)
 
 
 def _update_and_context():
@@ -69,3 +76,25 @@ class TestStart:
         text = update.effective_message.reply_text.await_args.args[0]
         assert HELP_TEXT in text
         assert "reply_markup" in kwargs
+
+
+class TestHelpButton:
+    """Постоянная кнопка /help в меню внизу чата."""
+
+    def test_keyboard_has_help_button(self):
+        keyboard = _main_keyboard()
+        texts = [button.text for row in keyboard.keyboard for button in row]
+        assert MENU_HELP in texts
+
+    def test_keyboard_stays_persistent(self):
+        keyboard = _main_keyboard()
+        assert keyboard.is_persistent is True
+        assert keyboard.resize_keyboard is True
+
+    async def test_button_text_replies_with_help(self):
+        # Кнопка приходит обычным текстом; если entity команды нет,
+        # отвечать обязан settings_text_input.
+        update, context = _update_and_context()
+        update.message.text = MENU_HELP
+        await settings_text_input(update, context)
+        update.message.reply_text.assert_awaited_once_with(HELP_TEXT)

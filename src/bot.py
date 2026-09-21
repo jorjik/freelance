@@ -204,6 +204,7 @@ def _only_admin(user_id: int) -> bool:
 
 MENU_START = "Парсинг"
 MENU_SETTINGS = "Настройка"
+MENU_HELP = "/help"
 
 
 def _main_keyboard() -> ReplyKeyboardMarkup:
@@ -211,6 +212,7 @@ def _main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton(MENU_START), KeyboardButton(MENU_SETTINGS)],
+            [KeyboardButton(MENU_HELP)],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -779,12 +781,16 @@ async def settings_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_data = context.user_data or {}
 
     # Постоянное меню — имеет приоритет над вводом значения
-    if text in (MENU_START, MENU_SETTINGS):
+    if text in (MENU_START, MENU_SETTINGS, MENU_HELP):
         _clear_awaiting(context)
         if text == MENU_START:
             await _open_parser(update.message)
-        else:
+        elif text == MENU_SETTINGS:
             await _open_settings(update.message)
+        else:
+            # Кнопка «/help» приходит как текст; если Telegram не проставил
+            # entity команды, сюда обязан ответить тот же help_command.
+            await help_command(update, context)
         return
 
     if user_data.get("awaiting_api_key"):

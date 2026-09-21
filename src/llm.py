@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import time
+from collections import deque
 from typing import Any, Callable, Optional
 
 import httpx
@@ -60,8 +61,32 @@ _last_failure_notify = 0.0
 FAILURE_NOTIFY_INTERVAL = 300  # Notify at most once per 5 minutes
 
 # Cooldown after a 402 (quota exhausted): stop calling the LLM entirely
-QUOTA_COOLDOWN_SECONDS = 600  # 10 minutes
+QUOTA_COOLDOWN_SECONDS = 600  # 10 минут
 _quota_cooldown_until = 0.0
+
+# --- Пейсинг под лимит токенов провайдера --------------------------------
+# Groq на бесплатном тире даёт 8000 токенов в минуту на ключ (заголовок
+# x-ratelimit-limit-tokens). gpt-oss-120b тратит часть бюджета на reasoning:
+# один вызов с постом — это 400–1000 токенов. Несколько постов подряд, а тем
+# более повторы после 429, выжигают окно целиком, и тогда падает фильтрация
+# всех следующих постов. Поэтому вызовы сериализуем и держим окно расходов
+# ниже лимита.
+TPM_BUDGET = 7000  # запас: тот же ключ расходует dry-run в контейнере
+TPM_WINDOW_SECONDS = 60.0
+# 429 — это исчерпанное окно, а не разовый сбой: окно освобождается за
+# минуту, поэтому бэкофф 1/2/4 с не помогает и пост теряется.
+RATE_LIMIT_WAIT_SECONDS = 25.0
+MAX_RATE_LIMIT_WAIT_SECONDS = 60.0
+# gpt-oss-120b тратит бюджет на reasoning. reasoning_effort=low проверен на
+# живой модели: 436 -> 237 токенов на вызов при том же JSON-решении.
+REASONING_EFFORT = "low"
+MAX_TOKENS_JUDGE = 400
+MAX_TOKENS_RESPONSE = 1600
+
+# Израсходованные токены: пары (момент времени, токенов за вызов).
+_spent_tokens: deque[tuple[float, int]] = deque()
+# Один вызов API за раз: параллельные посты не должны делить окно вдвоём.
+_call_lock = asyncio.Lock()
 
 
 def is_quota_paused() -> bool:
@@ -96,6 +121,70 @@ def set_notify_callback(callback: Callable) -> None:
     _notify_callback = callback
 
 
+def _retry_after_seconds(response) -> Optional[float]:
+    """Сколько секунд просит подождать провайдер (заголовок Retry-After)."""
+    raw = (response.headers.get("retry-after") or "").strip()
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return min(max(seconds, 1.0), MAX_RATE_LIMIT_WAIT_SECONDS)
+
+
+def _rate_limit_reason(response) -> str:
+    """Причина 429 из тела ответа. Ключи и тела запросов сюда не попадают."""
+    try:
+        body = response.json()
+        message = str((body.get("error") or {}).get("message") or "")
+    except Exception:
+        return ""
+    return message[:180]
+
+
+def _prune_spent(now: float) -> None:
+    while _spent_tokens and now - _spent_tokens[0][0] > TPM_WINDOW_SECONDS:
+        _spent_tokens.popleft()
+
+
+def _spent_in_window(now: float) -> int:
+    _prune_spent(now)
+    return sum(tokens for _, tokens in _spent_tokens)
+
+
+def _estimate_tokens(payload: dict) -> int:
+    """Грубая оценка расхода вызова: ~3 знака на токен плюс лимит ответа."""
+    chars = sum(
+        len(str(message.get("content", ""))) for message in payload.get("messages", [])
+    )
+    return chars // 3 + int(payload.get("max_tokens") or 0)
+
+
+async def _wait_for_token_budget(payload: dict) -> None:
+    """Ждёт, пока в минутном окне освободится место под следующий вызов."""
+    while True:
+        now = time.monotonic()
+        spent = _spent_in_window(now)
+        if spent + _estimate_tokens(payload) <= TPM_BUDGET:
+            return
+        wait_time = TPM_WINDOW_SECONDS - (now - _spent_tokens[0][0]) + 0.5
+        logger.info(
+            "Лимит токенов провайдера: израсходовано %d из %d за минуту, ждём %.0f с",
+            spent,
+            TPM_BUDGET,
+            wait_time,
+        )
+        await asyncio.sleep(max(wait_time, 1.0))
+
+
+def _remember_spent(result: dict) -> None:
+    """Запоминает фактический расход вызова для пейсинга."""
+    tokens = int((result.get("usage") or {}).get("total_tokens") or 0)
+    if tokens > 0:
+        _spent_tokens.append((time.monotonic(), tokens))
+
+
 def _format_llm_error(exc: BaseException) -> str:
     """Human-readable description of an LLM API error."""
     if isinstance(exc, httpx.HTTPStatusError):
@@ -104,6 +193,11 @@ def _format_llm_error(exc: BaseException) -> str:
             return "402 Payment Required — баланс/токены LLM исчерпаны, пополни аккаунт"
         if status == 401:
             return "401 Unauthorized — проверь LLM API ключ"
+        if status == 429:
+            reason = _rate_limit_reason(exc.response)
+            return "429 Too Many Requests — лимит провайдера исчерпан" + (
+                f" ({reason})" if reason else ""
+            )
         return f"HTTP {status}: {exc}"
     # Порядок важен: TimeoutException — подкласс TransportError.
     if isinstance(exc, httpx.TimeoutException):
@@ -167,6 +261,17 @@ def _format_filter_rules(filter_rules: dict) -> str:
     )
 
 
+def _reasoning_params() -> dict:
+    """reasoning_effort понимает не каждый OpenAI-совместимый провайдер.
+
+    Groq и OpenAI — да, остальные на незнакомый параметр отвечают 400,
+    поэтому шлём его только туда, где он проверен.
+    """
+    if "groq" in settings.llm_base_url:
+        return {"reasoning_effort": REASONING_EFFORT}
+    return {}
+
+
 def normalize_decision(value: Any) -> str:
     decision = str(value or "REVIEW").strip().upper()
     if decision not in ALLOWED_DECISIONS:
@@ -175,51 +280,74 @@ def normalize_decision(value: Any) -> str:
 
 
 async def _call_llm_with_retry(payload: dict, max_retries: int = 3) -> dict:
-    """Call LLM API with exponential backoff retry."""
+    """Вызов LLM API с повторами.
+
+    429 (исчерпано окно токенов/запросов) ждёт столько, сколько просит
+    провайдер в Retry-After, иначе — до освобождения минутного окна.
+    Сетевые сбои и 5xx — экспоненциальный бэкофф 1/2/4 с.
+    """
     global _consecutive_failures
     last_error = None
 
-    for attempt in range(max_retries + 1):
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post(
-                    f"{settings.llm_base_url}/chat/completions",
-                    headers={"Authorization": f"Bearer {get_llm_api_key()}"},
-                    json=payload,
-                )
-                resp.raise_for_status()
-                result = resp.json()
-                # Success — reset failure counter
-                _consecutive_failures = 0
-                return result
-        except httpx.HTTPStatusError as e:
-            last_error = e
-            status = e.response.status_code
-            # Don't retry on client errors (except 429 rate limit)
-            if 400 <= status < 500 and status != 429:
-                logger.warning(f"LLM API client error {status}: {e}")
-                if _is_quota_error(e):
-                    await notify_llm_error(e)
-                else:
-                    _consecutive_failures += 1
-                    if _consecutive_failures >= 3:
-                        await _notify_admin(
-                            f"⚠️ LLM API ошибка: {_format_llm_error(e)} (повторяется)."
-                        )
-                raise
-            # Retry on 429, 500, 502, 503, 504
-        except httpx.TransportError as e:
-            # TransportError покрывает и обрывы соединения (ReadError),
-            # и таймауты — раньше ловились только два подкласса, ReadError
-            # пролетал без ретраев и срывал фильтрацию поста.
-            last_error = e
-            logger.warning(f"LLM API network error: {e}")
+    async with _call_lock:
+        for attempt in range(max_retries + 1):
+            await _wait_for_token_budget(payload)
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.post(
+                        f"{settings.llm_base_url}/chat/completions",
+                        headers={"Authorization": f"Bearer {get_llm_api_key()}"},
+                        json=payload,
+                    )
+                    resp.raise_for_status()
+                    result = resp.json()
+                    _remember_spent(result)
+                    # Success — reset failure counter
+                    _consecutive_failures = 0
+                    return result
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                status = e.response.status_code
+                if status == 429:
+                    wait_time = _retry_after_seconds(e.response) or min(
+                        RATE_LIMIT_WAIT_SECONDS * (attempt + 1),
+                        MAX_RATE_LIMIT_WAIT_SECONDS,
+                    )
+                    logger.warning(
+                        "LLM API 429 (лимит провайдера): %s; попытка %d/%d, ждём %.0f с",
+                        _rate_limit_reason(e.response) or "причина не указана",
+                        attempt + 1,
+                        max_retries + 1,
+                        wait_time,
+                    )
+                    if attempt < max_retries:
+                        await asyncio.sleep(wait_time)
+                    continue
+                # Don't retry on client errors
+                if 400 <= status < 500:
+                    logger.warning(f"LLM API client error {status}: {e}")
+                    if _is_quota_error(e):
+                        await notify_llm_error(e)
+                    else:
+                        _consecutive_failures += 1
+                        if _consecutive_failures >= 3:
+                            await _notify_admin(
+                                f"⚠️ LLM API ошибка: {_format_llm_error(e)} (повторяется)."
+                            )
+                    raise
+                # Retry on 500, 502, 503, 504
+            except httpx.TransportError as e:
+                # TransportError покрывает и обрывы соединения (ReadError),
+                # и таймауты — раньше ловились только два подкласса, ReadError
+                # пролетал без ретраев и срывал фильтрацию поста.
+                last_error = e
+                logger.warning(f"LLM API network error: {e}")
 
-        # Exponential backoff: 1s, 2s, 4s...
-        if attempt < max_retries:
-            wait_time = 2 ** attempt
-            logger.info(f"Retry {attempt + 1}/{max_retries} after {wait_time}s...")
-            await asyncio.sleep(wait_time)
+            # Exponential backoff: 1s, 2s, 4s...
+            if attempt < max_retries:
+                wait_time = 2 ** attempt
+                logger.info(f"Retry {attempt + 1}/{max_retries} after {wait_time}s...")
+                await asyncio.sleep(wait_time)
 
     # All retries exhausted
     _consecutive_failures += 1
@@ -251,11 +379,13 @@ async def judge_vacancy(text: str, filter_rules: dict) -> dict:
     payload = {
         "model": get_llm_model(),
         "temperature": 0,
+        "max_tokens": MAX_TOKENS_JUDGE,
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
+        **_reasoning_params(),
     }
     result = await _call_llm_with_retry(payload)
     content = result["choices"][0]["message"]["content"]
@@ -286,10 +416,12 @@ async def generate_response_text(vacancy_text: str) -> str:
     payload = {
         "model": get_llm_model(),
         "temperature": 0.5,
+        "max_tokens": MAX_TOKENS_RESPONSE,
         "messages": [
             {"role": "system", "content": "Ты опытный фрилансер."},
             {"role": "user", "content": prompt},
         ],
+        **_reasoning_params(),
     }
     result = await _call_llm_with_retry(payload)
     return result["choices"][0]["message"]["content"].strip()

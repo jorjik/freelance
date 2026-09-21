@@ -49,11 +49,13 @@ def _reset_llm_state():
     llm._last_failure_notify = 0.0
     llm._quota_cooldown_until = 0.0
     llm._notify_callback = None
+    llm._spent_tokens.clear()
     yield
     llm._consecutive_failures = 0
     llm._last_failure_notify = 0.0
     llm._quota_cooldown_until = 0.0
     llm._notify_callback = None
+    llm._spent_tokens.clear()
 
 
 class TestNormalizeDecision:
@@ -245,3 +247,124 @@ class TestJudgeVacancyParsing:
             result = await judge_vacancy("vacancy text", {})
         assert result["decision"] == "REVIEW"
         assert result["reason"] == "Failed to parse LLM response"
+
+
+def _rate_limit_error(retry_after: str | None = None, message: str | None = None):
+    """httpx-ошибка 429 в форме, в которой её отдаёт Groq."""
+    response = MagicMock()
+    response.status_code = 429
+    response.headers = {} if retry_after is None else {"retry-after": retry_after}
+    if message is None:
+        response.json.side_effect = ValueError("not json")
+    else:
+        response.json.return_value = {"error": {"message": message}}
+    return httpx.HTTPStatusError("Client error '429'", request=MagicMock(), response=response)
+
+
+class TestRateLimitHandling:
+    async def test_429_uses_retry_after_header(self):
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.json.return_value = {"ok": True}
+        post = AsyncMock(side_effect=[_rate_limit_error(retry_after="20"), ok])
+        with patch("src.llm.httpx.AsyncClient") as client_cls, patch(
+            "src.llm.asyncio.sleep", new=AsyncMock()
+        ) as sleep_mock:
+            client_cls.return_value.__aenter__ = AsyncMock(return_value=MagicMock(post=post))
+            client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            result = await _call_llm_with_retry({"messages": []})
+        assert result == {"ok": True}
+        assert sleep_mock.await_args.args[0] == 20.0
+
+    async def test_429_without_header_waits_for_window_not_one_second(self):
+        # Регрессия: бэкофф 1/2/4 с не освобождает минутное окно TPM,
+        # поэтому пост терялся после четвёртой попытки.
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.json.return_value = {"ok": True}
+        post = AsyncMock(side_effect=[_rate_limit_error(), _rate_limit_error(), ok])
+        with patch("src.llm.httpx.AsyncClient") as client_cls, patch(
+            "src.llm.asyncio.sleep", new=AsyncMock()
+        ) as sleep_mock:
+            client_cls.return_value.__aenter__ = AsyncMock(return_value=MagicMock(post=post))
+            client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            await _call_llm_with_retry({"messages": []})
+        waits = [call.args[0] for call in sleep_mock.await_args_list]
+        assert waits and all(wait >= llm.RATE_LIMIT_WAIT_SECONDS for wait in waits)
+
+    async def test_429_message_is_human_readable(self):
+        error = _rate_limit_error(message="Rate limit reached for model on tokens per minute")
+        text = _format_llm_error(error)
+        assert "лимит провайдера исчерпан" in text
+        assert "tokens per minute" in text
+        assert "for url" not in text
+
+    def test_retry_after_is_capped_and_ignores_garbage(self):
+        assert llm._retry_after_seconds(_rate_limit_error(retry_after="600").response) == (
+            llm.MAX_RATE_LIMIT_WAIT_SECONDS
+        )
+        assert llm._retry_after_seconds(_rate_limit_error(retry_after="soon").response) is None
+        assert llm._retry_after_seconds(_rate_limit_error().response) is None
+
+    async def test_call_waits_when_minute_budget_is_spent(self):
+        payload = {
+            "messages": [{"content": "x" * 3000}],
+            "max_tokens": llm.MAX_TOKENS_JUDGE,
+        }
+        llm._spent_tokens.append((time.monotonic(), llm.TPM_BUDGET))
+        sleeps: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            llm._spent_tokens.clear()  # окно освободилось
+
+        result_payload = {"choices": [{"message": {"content": "{}"}}]}
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = result_payload
+        with patch("src.llm.httpx.AsyncClient") as client_cls, patch(
+            "src.llm.asyncio.sleep", new=fake_sleep
+        ):
+            client_cls.return_value.__aenter__ = AsyncMock(return_value=MagicMock(post=AsyncMock(return_value=response)))
+            client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            result = await _call_llm_with_retry(payload)
+        assert result == result_payload
+        assert sleeps and sleeps[0] >= 1.0
+
+    async def test_usage_is_remembered_for_pacing(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "choices": [{"message": {"content": "{}"}}],
+            "usage": {"total_tokens": 1234},
+        }
+        with patch("src.llm.httpx.AsyncClient") as client_cls:
+            client_cls.return_value.__aenter__ = AsyncMock(return_value=MagicMock(post=AsyncMock(return_value=response)))
+            client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            await _call_llm_with_retry({"messages": []})
+        assert [tokens for _, tokens in llm._spent_tokens] == [1234]
+
+
+class TestRequestBudget:
+    async def test_judge_payload_caps_response_and_reasoning(self):
+        payload = {"choices": [{"message": {"content": '{"decision": "REJECT"}'}}]}
+        call = AsyncMock(return_value=payload)
+        with patch("src.llm._call_llm_with_retry", new=call):
+            await judge_vacancy("vacancy text", {})
+        sent = call.await_args.args[0]
+        assert sent["max_tokens"] == llm.MAX_TOKENS_JUDGE
+        if "groq" in llm.settings.llm_base_url:
+            assert sent["reasoning_effort"] == llm.REASONING_EFFORT
+
+    async def test_response_payload_caps_response(self):
+        payload = {"choices": [{"message": {"content": "текст отклика"}}]}
+        call = AsyncMock(return_value=payload)
+        with patch("src.llm._call_llm_with_retry", new=call):
+            await llm.generate_response_text("vacancy text")
+        assert call.await_args.args[0]["max_tokens"] == llm.MAX_TOKENS_RESPONSE
+
+    def test_reasoning_effort_is_not_sent_to_other_providers(self):
+        with patch.object(llm.settings, "llm_base_url", "https://api.openai.com/v1"):
+            assert llm._reasoning_params() == {}
+        with patch.object(llm.settings, "llm_base_url", "https://api.groq.com/openai/v1"):
+            assert llm._reasoning_params() == {"reasoning_effort": llm.REASONING_EFFORT}

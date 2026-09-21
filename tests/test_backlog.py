@@ -8,7 +8,7 @@ import os
 import sqlite3
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
 os.environ.setdefault("TELEGRAM_API_ID", "1")
@@ -18,6 +18,7 @@ os.environ.setdefault("LLM_API_KEY", "test-key")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import httpx
 import pytest
 
 from src import db as db_module
@@ -127,6 +128,25 @@ class TestRefilterPending:
         assert await parser.refilter_pending() == 0
         mocks["notify"].assert_awaited_once()
         assert mocks["judge"].await_count == 1
+
+    async def test_bad_post_is_skipped_and_batch_continues(self, parser, mocks):
+        # Реальный случай: qwen на одном посте вернул 400 json_validate_failed.
+        # Это ошибка поста, а не эндпоинта — остальные посты должны пройти.
+        bad_response = MagicMock()
+        bad_response.status_code = 400
+        bad_post = httpx.HTTPStatusError(
+            "400 Bad Request", request=MagicMock(), response=bad_response
+        )
+        mocks["pending"].return_value = [_pending(61), _pending(62)]
+        mocks["judge"].side_effect = [bad_post, _judge_result("REJECT")]
+
+        processed = await parser.refilter_pending()
+
+        assert processed == 1
+        assert mocks["judge"].await_count == 2
+        mocks["update"].assert_awaited_once()
+        # Пост-специфичная ошибка не должна дёргать админа.
+        mocks["notify"].assert_not_awaited()
 
     async def test_batch_is_bounded_and_recent(self, parser, mocks):
         mocks["pending"].return_value = [_pending(51)]

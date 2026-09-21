@@ -3,6 +3,7 @@ import logging
 from pathlib import Path
 from typing import Awaitable, Callable, List, Optional
 
+import httpx
 from telethon import TelegramClient, events
 from telethon.tl.types import Channel
 
@@ -247,6 +248,26 @@ class Parser:
             except QuotaPausedError as exc:
                 logger.info("Догон пропущенных постов остановлен: %s", exc)
                 break
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if not 400 <= status < 500:
+                    logger.warning("Догон поста %s не удался: %s", vacancy["id"], exc)
+                    await notify_llm_error(
+                        exc,
+                        context=(
+                            f"Повторная фильтрация поста "
+                            f"{vacancy['username']}/{vacancy['message_id']} пропущена"
+                        ),
+                    )
+                    break
+                # 4xx — ошибка конкретного поста (например, модель не собрала
+                # JSON): пропускаем его и идём к следующему, эндпоинт живой.
+                logger.warning(
+                    "Догон поста %s отклонён API (%d), идём дальше",
+                    vacancy["id"],
+                    status,
+                )
+                continue
             except Exception as exc:
                 logger.warning("Догон поста %s не удался: %s", vacancy["id"], exc)
                 await notify_llm_error(

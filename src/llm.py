@@ -87,7 +87,9 @@ DAILY_LIMIT_COOLDOWN_SECONDS = 900  # 15 минут
 # gpt-oss-120b тратит бюджет на reasoning. reasoning_effort=low проверен на
 # живой модели: 436 -> 237 токенов на вызов при том же JSON-решении.
 REASONING_EFFORT = "low"
-MAX_TOKENS_JUDGE = 400
+# Запас на reasoning + JSON: на 400 токенах qwen в режиме json_object
+# обрывался и провайдер отвечал 400 json_validate_failed вместо решения.
+MAX_TOKENS_JUDGE = 800
 MAX_TOKENS_RESPONSE = 1600
 
 # Израсходованные токены: пары (момент времени, токенов за вызов).

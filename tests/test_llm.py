@@ -335,10 +335,11 @@ class TestRateLimitHandling:
     async def test_daily_limit_429_pauses_filtering_without_retries(self):
         # Регрессия: суточный лимит не освобождается за минуту, а бот
         # молотил 4 попытки по 60 с и терял посты один за другим.
+        # 113 с — реальный Retry-After Groq на выжранном суточном окне.
         error = _rate_limit_error(
-            retry_after="3600",
+            retry_after="113",
             message="Rate limit reached for model on tokens per day (TPD): "
-            "Limit 200000, Used 199752. Please try again in 3599s.",
+            "Limit 200000, Used 199439. Please try again in 1m53s.",
         )
         callback = AsyncMock()
         llm.set_notify_callback(callback)

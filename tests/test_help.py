@@ -79,12 +79,17 @@ class TestStart:
 
 
 class TestHelpButton:
-    """Постоянная кнопка /help в меню внизу чата."""
+    """Постоянная кнопка справки в меню внизу чата."""
 
-    def test_keyboard_has_help_button(self):
+    def test_three_buttons_in_one_row(self):
         keyboard = _main_keyboard()
-        texts = [button.text for row in keyboard.keyboard for button in row]
-        assert MENU_HELP in texts
+        assert len(keyboard.keyboard) == 1
+        assert [button.text for button in keyboard.keyboard[0]] == [
+            "Парсинг",
+            "Настройка",
+            "?",
+        ]
+        assert keyboard.keyboard[0][-1].text == MENU_HELP
 
     def test_keyboard_stays_persistent(self):
         keyboard = _main_keyboard()
@@ -92,8 +97,7 @@ class TestHelpButton:
         assert keyboard.resize_keyboard is True
 
     async def test_button_text_replies_with_help(self):
-        # Кнопка приходит обычным текстом; если entity команды нет,
-        # отвечать обязан settings_text_input.
+        # Кнопка «?» приходит обычным текстом, не командой.
         update, context = _update_and_context()
         update.message.text = MENU_HELP
         await settings_text_input(update, context)

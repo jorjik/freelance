@@ -204,15 +204,14 @@ def _only_admin(user_id: int) -> bool:
 
 MENU_START = "Парсинг"
 MENU_SETTINGS = "Настройка"
-MENU_HELP = "/help"
+MENU_HELP = "?"
 
 
 def _main_keyboard() -> ReplyKeyboardMarkup:
     """Постоянное меню внизу чата."""
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton(MENU_START), KeyboardButton(MENU_SETTINGS)],
-            [KeyboardButton(MENU_HELP)],
+            [KeyboardButton(MENU_START), KeyboardButton(MENU_SETTINGS), KeyboardButton(MENU_HELP)],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -788,8 +787,7 @@ async def settings_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif text == MENU_SETTINGS:
             await _open_settings(update.message)
         else:
-            # Кнопка «/help» приходит как текст; если Telegram не проставил
-            # entity команды, сюда обязан ответить тот же help_command.
+            # Кнопка «?» — не команда, поэтому справку отдаёт только эта ветка.
             await help_command(update, context)
         return
 

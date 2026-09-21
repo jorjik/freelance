@@ -300,9 +300,10 @@ class TestRateLimitHandling:
         assert "for url" not in text
 
     def test_retry_after_is_capped_and_ignores_garbage(self):
-        assert llm._retry_after_seconds(_rate_limit_error(retry_after="600").response) == (
-            llm.MAX_RATE_LIMIT_WAIT_SECONDS
-        )
+        assert llm._retry_after_seconds(
+            _rate_limit_error(retry_after="99999").response
+        ) == llm.MAX_RETRY_AFTER_SECONDS
+        assert llm._retry_after_seconds(_rate_limit_error(retry_after="55").response) == 55.0
         assert llm._retry_after_seconds(_rate_limit_error(retry_after="soon").response) is None
         assert llm._retry_after_seconds(_rate_limit_error().response) is None
 
@@ -330,6 +331,54 @@ class TestRateLimitHandling:
             result = await _call_llm_with_retry(payload)
         assert result == result_payload
         assert sleeps and sleeps[0] >= 1.0
+
+    async def test_daily_limit_429_pauses_filtering_without_retries(self):
+        # Регрессия: суточный лимит не освобождается за минуту, а бот
+        # молотил 4 попытки по 60 с и терял посты один за другим.
+        error = _rate_limit_error(
+            retry_after="3600",
+            message="Rate limit reached for model on tokens per day (TPD): "
+            "Limit 200000, Used 199752. Please try again in 3599s.",
+        )
+        callback = AsyncMock()
+        llm.set_notify_callback(callback)
+        post = AsyncMock(side_effect=error)
+        with patch("src.llm.httpx.AsyncClient") as client_cls, patch(
+            "src.llm.asyncio.sleep", new=AsyncMock()
+        ):
+            client_cls.return_value.__aenter__ = AsyncMock(return_value=MagicMock(post=post))
+            client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            with pytest.raises(QuotaPausedError):
+                await _call_llm_with_retry({"messages": []})
+        assert post.await_count == 1  # ни ожидания, ни повторов
+        assert is_quota_paused()
+        assert "Суточный лимит" in callback.await_args.args[0]
+
+    async def test_daily_limit_short_wait_is_retried(self):
+        # Окно скользящее: если провайдер просит подождать минуту, ждём
+        # и повторяем — пост проходит.
+        error = _rate_limit_error(
+            retry_after="55",
+            message="Rate limit reached for model on tokens per day (TPD): "
+            "Limit 200000, Used 199752. Please try again in 55s.",
+        )
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.json.return_value = {"ok": True}
+        post = AsyncMock(side_effect=[error, ok])
+        with patch("src.llm.httpx.AsyncClient") as client_cls, patch(
+            "src.llm.asyncio.sleep", new=AsyncMock()
+        ) as sleep_mock:
+            client_cls.return_value.__aenter__ = AsyncMock(return_value=MagicMock(post=post))
+            client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            result = await _call_llm_with_retry({"messages": []})
+        assert result == {"ok": True}
+        assert sleep_mock.await_args.args[0] == 55.0
+        assert not is_quota_paused()
+
+    def test_daily_limit_detection(self):
+        assert llm._is_daily_limit("... on tokens per day (TPD): Limit 200000")
+        assert not llm._is_daily_limit("... on tokens per minute (TPM): Limit 8000")
 
     async def test_usage_is_remembered_for_pacing(self):
         response = MagicMock()

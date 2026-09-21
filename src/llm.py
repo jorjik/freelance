@@ -77,6 +77,12 @@ TPM_WINDOW_SECONDS = 60.0
 # минуту, поэтому бэкофф 1/2/4 с не помогает и пост теряется.
 RATE_LIMIT_WAIT_SECONDS = 25.0
 MAX_RATE_LIMIT_WAIT_SECONDS = 60.0
+# Провайдер ограничивает и суточный расход токенов (Groq: 200000 на модель в
+# организации, окно скользящее). Если он просит подождать дольше этого порога,
+# ждать в реальном времени бессмысленно — приостанавливаем фильтрацию.
+MAX_RETRY_AFTER_SECONDS = 3600.0
+MAX_DAILY_WAIT_SECONDS = 120.0
+DAILY_LIMIT_COOLDOWN_SECONDS = 900  # 15 минут
 # gpt-oss-120b тратит бюджет на reasoning. reasoning_effort=low проверен на
 # живой модели: 436 -> 237 токенов на вызов при том же JSON-решении.
 REASONING_EFFORT = "low"
@@ -130,17 +136,27 @@ def _retry_after_seconds(response) -> Optional[float]:
         seconds = float(raw)
     except (TypeError, ValueError):
         return None
-    return min(max(seconds, 1.0), MAX_RATE_LIMIT_WAIT_SECONDS)
+    return min(max(seconds, 1.0), MAX_RETRY_AFTER_SECONDS)
 
 
 def _rate_limit_reason(response) -> str:
-    """Причина 429 из тела ответа. Ключи и тела запросов сюда не попадают."""
+    """Причина 429 из тела ответа. Ключи и тела запросов сюда не попадают.
+
+    Провайдер в этой же строке пишет, когда окно освободится
+    («Please try again in 55s»), поэтому текст не обрезаем по живому.
+    """
     try:
         body = response.json()
         message = str((body.get("error") or {}).get("message") or "")
     except Exception:
         return ""
-    return message[:180]
+    return message[:400]
+
+
+def _is_daily_limit(reason: str) -> bool:
+    """429 по суточному лимиту токенов (TPD), а не по минутному окну."""
+    lowered = reason.lower()
+    return "per day" in lowered or "(tpd)" in lowered
 
 
 def _prune_spent(now: float) -> None:
@@ -217,23 +233,28 @@ def _is_quota_error(exc: BaseException) -> bool:
 
 async def notify_llm_error(exc: BaseException, context: str = "") -> None:
     """Notify admin about an LLM failure (throttled to once per 5 min)."""
-    global _quota_cooldown_until
     if _is_quota_error(exc):
         # Quota exhaustion is urgent: bypass the 5-minute throttle,
         # arm the cooldown and notify only on the first 402 of a burst.
-        was_paused = is_quota_paused()
-        _quota_cooldown_until = time.time() + QUOTA_COOLDOWN_SECONDS
-        if not was_paused:
-            await _notify_admin(
-                "🔴 Баланс/токены LLM исчерпаны (402).\n"
-                f"Фильтрация приостановлена на {QUOTA_COOLDOWN_SECONDS // 60} мин.",
-                force=True,
-            )
+        await _arm_quota_cooldown(
+            QUOTA_COOLDOWN_SECONDS,
+            "🔴 Баланс/токены LLM исчерпаны (402).\n"
+            f"Фильтрация приостановлена на {QUOTA_COOLDOWN_SECONDS // 60} мин.",
+        )
         return
     message = f"⚠️ Ошибка LLM API: {_format_llm_error(exc)}"
     if context:
         message += f"\nКонтекст: {context}"
     await _notify_admin(message)
+
+
+async def _arm_quota_cooldown(seconds: int, message: str) -> None:
+    """Приостанавливает фильтрацию и уведомляет админа один раз на серию."""
+    global _quota_cooldown_until
+    was_paused = is_quota_paused()
+    _quota_cooldown_until = max(_quota_cooldown_until, time.time() + seconds)
+    if not was_paused:
+        await _notify_admin(message, force=True)
 
 
 SYSTEM_PROMPT = (
@@ -309,13 +330,30 @@ async def _call_llm_with_retry(payload: dict, max_retries: int = 3) -> dict:
                 last_error = e
                 status = e.response.status_code
                 if status == 429:
-                    wait_time = _retry_after_seconds(e.response) or min(
-                        RATE_LIMIT_WAIT_SECONDS * (attempt + 1),
+                    reason = _rate_limit_reason(e.response) or "причина не указана"
+                    retry_after = _retry_after_seconds(e.response)
+                    if _is_daily_limit(reason) and (
+                        retry_after is None or retry_after > MAX_DAILY_WAIT_SECONDS
+                    ):
+                        # Суточный бюджет выжран: ждать в реальном времени
+                        # нечего, посты будут падать один за другим.
+                        logger.warning("LLM API 429 (суточный лимит): %s", reason)
+                        await _arm_quota_cooldown(
+                            DAILY_LIMIT_COOLDOWN_SECONDS,
+                            "🔴 Суточный лимит токенов LLM исчерпан "
+                            f"({reason})\nФильтрация приостановлена на "
+                            f"{DAILY_LIMIT_COOLDOWN_SECONDS // 60} мин.",
+                        )
+                        # Не HTTPStatusError: админу уже ушло понятное
+                        # уведомление, повторять его из парсера не нужно.
+                        raise QuotaPausedError(f"суточный лимит токенов: {reason}")
+                    wait_time = min(
+                        retry_after or RATE_LIMIT_WAIT_SECONDS * (attempt + 1),
                         MAX_RATE_LIMIT_WAIT_SECONDS,
                     )
                     logger.warning(
                         "LLM API 429 (лимит провайдера): %s; попытка %d/%d, ждём %.0f с",
-                        _rate_limit_reason(e.response) or "причина не указана",
+                        reason,
                         attempt + 1,
                         max_retries + 1,
                         wait_time,

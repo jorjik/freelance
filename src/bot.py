@@ -222,6 +222,8 @@ def _format_accepted_message(post: dict) -> tuple[str, InlineKeyboardMarkup]:
     body = (post.get("text") or "").strip()
     link = (post.get("link") or "").strip()
     suffix = f"\n\nИсходный пост: {link}" if link else ""
+    if post.get("restored"):
+        suffix = "\n\n♻️ Пост из догона: раньше его не оценили из-за лимита LLM." + suffix
     max_body = 4000 - len(suffix)
     if len(body) > max_body:
         body = body[: max(0, max_body - 3)] + "..."

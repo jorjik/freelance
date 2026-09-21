@@ -16,9 +16,11 @@ from src.db import (
     are_filter_settings_complete,
     get_channels,
     get_vacancy_decision,
+    list_pending_vacancies,
 )
 from src.llm import (
     QuotaPausedError,
+    is_quota_paused,
     judge_vacancy,
     normalize_decision,
     notify_llm_error,
@@ -29,6 +31,14 @@ logger = logging.getLogger(__name__)
 
 AcceptedCallback = Callable[[dict], Awaitable[None]]
 DOWNLOADS_DIR = Path("downloads")
+
+# Догон пропущенных постов: пока провайдер отдаёт 429, посты остаются в базе
+# без решения и админу не показываются. Раз в 5 минут берём небольшую пачку
+# свежих и оцениваем заново — маленькими порциями, чтобы не выжечь лимит,
+# который нужен живому потоку.
+BACKLOG_SWEEP_INTERVAL_SECONDS = 300
+BACKLOG_BATCH_SIZE = 10
+BACKLOG_MAX_AGE_HOURS = 24
 
 
 class Parser:
@@ -45,6 +55,7 @@ class Parser:
         self._handler = None
         self._on_accepted: Optional[AcceptedCallback] = None
         self._watch_usernames: List[str] = []
+        self._backlog_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
         DOWNLOADS_DIR.mkdir(exist_ok=True)
 
@@ -211,6 +222,79 @@ class Parser:
                 "accepted_posts": accepted_posts,
             }
 
+    async def refilter_pending(self, limit: int = BACKLOG_BATCH_SIZE) -> int:
+        """Переоценивает посты, оставшиеся без решения ИИ.
+
+        Пропуск появляется, когда провайдер отдал 429, и без догона такой
+        пост админу не показывается никогда. Возвращает число обработанных.
+        """
+        if is_quota_paused():
+            return 0
+        if not await are_filter_settings_complete():
+            return 0
+        pending = await list_pending_vacancies(
+            limit=limit, max_age_hours=BACKLOG_MAX_AGE_HOURS
+        )
+        if not pending:
+            return 0
+        filter_rules = await get_filter_settings()
+        processed = 0
+        for vacancy in pending:
+            if is_quota_paused():
+                break
+            try:
+                ai = await judge_vacancy(vacancy["text"], filter_rules)
+            except QuotaPausedError as exc:
+                logger.info("Догон пропущенных постов остановлен: %s", exc)
+                break
+            except Exception as exc:
+                logger.warning("Догон поста %s не удался: %s", vacancy["id"], exc)
+                await notify_llm_error(
+                    exc,
+                    context=(
+                        f"Повторная фильтрация поста "
+                        f"{vacancy['username']}/{vacancy['message_id']} пропущена"
+                    ),
+                )
+                break
+            decision = AIDecision(normalize_decision(ai["decision"]))
+            await update_vacancy_ai(vacancy["id"], decision.value, ai.get("reason", ""))
+            processed += 1
+            if decision != AIDecision.ACCEPT or self._on_accepted is None:
+                continue
+            username = vacancy["username"]
+            uname = username.lstrip("@")
+            await self._on_accepted(
+                {
+                    "id": vacancy["id"],
+                    "text": vacancy["text"],
+                    "reason": ai.get("reason", ""),
+                    "message_id": vacancy["message_id"],
+                    "link": f"https://t.me/{uname}/{vacancy['message_id']}",
+                    "channel": username,
+                    "restored": True,
+                }
+            )
+        if processed:
+            logger.info("Догон пропущенных постов: обработано %d", processed)
+        return processed
+
+    def _start_backlog_sweeper(self) -> None:
+        if self._backlog_task is not None and not self._backlog_task.done():
+            return
+        self._backlog_task = asyncio.create_task(self._backlog_loop())
+
+    async def _backlog_loop(self) -> None:
+        """Периодически догоняет пропущенные посты, пока идёт realtime."""
+        while True:
+            await asyncio.sleep(BACKLOG_SWEEP_INTERVAL_SECONDS)
+            try:
+                await self.refilter_pending()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Догон пропущенных постов упал")
+
     async def start_realtime(self, on_accepted: AcceptedCallback) -> None:
         async with self._lock:
             await self.start()
@@ -270,9 +354,22 @@ class Parser:
             self._handler = handler
             self.client.add_event_handler(handler, events.NewMessage(chats=entities))
             self._listening = True
+            self._start_backlog_sweeper()
             logger.info("Realtime listening: %s", ", ".join(usernames))
 
+    async def _stop_backlog_sweeper(self) -> None:
+        task = self._backlog_task
+        self._backlog_task = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
     async def stop_realtime(self) -> None:
+        await self._stop_backlog_sweeper()
         if self._handler is not None:
             try:
                 self.client.remove_event_handler(self._handler)

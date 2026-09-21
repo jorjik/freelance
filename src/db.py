@@ -271,6 +271,31 @@ async def update_vacancy_ai(vacancy_id: int, decision: str, reason: str) -> None
         await db.commit()
 
 
+async def list_pending_vacancies(limit: int = 10, max_age_hours: int = 24) -> list[dict]:
+    """Вакансии без решения ИИ: пост сохранён, а оценить его не успели.
+
+    Ограничение по возрасту обязательно: в базе лежат сотни старых постов,
+    которые никогда не оценивались и оценивать их заново не нужно.
+    """
+    await init_db()
+    async with aiosqlite.connect(_db_path()) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT v.id, v.message_id, v.text, c.username
+            FROM vacancies v
+            JOIN channels c ON c.id = v.channel_id
+            WHERE v.ai_decision IS NULL
+              AND v.created_at >= datetime('now', ?)
+            ORDER BY v.id
+            LIMIT ?
+            """,
+            (f"-{int(max_age_hours)} hours", limit),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [dict(row) for row in rows]
+
+
 async def add_response(vacancy_id: int, telegram_id: int, text: str) -> int:
     await init_db()
     async with aiosqlite.connect(_db_path()) as db:

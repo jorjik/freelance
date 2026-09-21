@@ -174,8 +174,8 @@ def _response_actions_keyboard(vacancy_id: int, reply_text: str) -> InlineKeyboa
 
 FILTER_LABELS = {
     "filter_stack": "Стек / навыки",
-    "filter_budget_min": "Мин. бюджет",
-    "filter_budget_max": "Макс. бюджет (0 = без лимита)",
+    "filter_budget_min": "Мин. бюджет, $",
+    "filter_budget_max": "Макс. бюджет, $ (0 = без лимита)",
     "filter_take": "Что брать",
     "filter_skip": "Что не брать",
     "filter_notes": "Доп. указания для ИИ",
@@ -183,8 +183,9 @@ FILTER_LABELS = {
 
 FILTER_HINTS = {
     "filter_stack": "Например: Python, Django, Telegram bots",
-    "filter_budget_min": "Число, например: 200",
-    "filter_budget_max": "Число, например: 5000. 0 = без верхнего лимита",
+    "filter_budget_min": "Число в долларах, например: 200 (≈8 000 ₴ / 100 000 ₸)"
+    " Заказы дешевле не берём.",
+    "filter_budget_max": "Число в долларах, например: 5000. 0 = без верхнего лимита",
     "filter_take": "Например: Долгосрок, backend, API",
     "filter_skip": "Например: Верстка, 1С, срочно за еду",
     "filter_notes": "Любые доп. правила для ИИ",

@@ -12,7 +12,14 @@ sys.path.insert(0, "/app")
 from telethon import TelegramClient  # noqa: E402
 
 from src.config import settings  # noqa: E402
-from src.llm import judge_vacancy  # noqa: E402
+from src.llm import judge_vacancy, set_llm_model  # noqa: E402
+# Разведка жжёт суточный бюджет модели, а у Groq он свой на каждую модель
+# (200000 токенов на модель в организации). Бот фильтрует живые посты на
+# gpt-oss-120b, поэтому разведку гоняем на qwen: её бюджет отдельный, и
+# разведка больше не отбирает квоту у бота.
+DRYRUN_MODEL = "qwen/qwen3.8-27b"
+set_llm_model(DRYRUN_MODEL)
+
 
 logging.basicConfig(level=logging.WARNING)
 

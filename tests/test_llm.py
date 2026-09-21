@@ -417,4 +417,7 @@ class TestRequestBudget:
         with patch.object(llm.settings, "llm_base_url", "https://api.openai.com/v1"):
             assert llm._reasoning_params() == {}
         with patch.object(llm.settings, "llm_base_url", "https://api.groq.com/openai/v1"):
-            assert llm._reasoning_params() == {"reasoning_effort": llm.REASONING_EFFORT}
+            with patch("src.llm.get_llm_model", return_value="openai/gpt-oss-120b"):
+                assert llm._reasoning_params() == {"reasoning_effort": llm.REASONING_EFFORT}
+            with patch("src.llm.get_llm_model", return_value="qwen/qwen3.8-27b"):
+                assert llm._reasoning_params() == {}

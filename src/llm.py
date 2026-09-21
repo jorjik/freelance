@@ -291,9 +291,12 @@ def _reasoning_params() -> dict:
     Groq и OpenAI — да, остальные на незнакомый параметр отвечают 400,
     поэтому шлём его только туда, где он проверен.
     """
-    if "groq" in settings.llm_base_url:
-        return {"reasoning_effort": REASONING_EFFORT}
-    return {}
+    if "groq" not in settings.llm_base_url:
+        return {}
+    model = get_llm_model()
+    if "qwen" in model:
+        return {}
+    return {"reasoning_effort": REASONING_EFFORT}
 
 
 def normalize_decision(value: Any) -> str:

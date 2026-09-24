@@ -23,10 +23,12 @@ import pytest
 import src.llm as llm
 from src.llm import (
     QUOTA_COOLDOWN_SECONDS,
+    REASON_MAX_CHARS,
     QuotaPausedError,
     _call_llm_with_retry,
     _format_llm_error,
     _is_quota_error,
+    clean_reason,
     is_quota_paused,
     judge_vacancy,
     normalize_decision,
@@ -81,6 +83,38 @@ class TestFormatLlmError:
         text = _format_llm_error(_http_status_error(500))
         assert "HTTP 500" in text
 
+    def test_400_shows_provider_explanation(self):
+        # Регрессия: админу уходило «HTTP 400: Client error '400 Bad Request'»
+        # без причины, а Groq объясняет обрезанный JSON в error.message.
+        response = MagicMock()
+        response.status_code = 400
+        response.json.return_value = {
+            "error": {
+                "message": "Failed to generate JSON. Please adjust your prompt.",
+                "code": "json_validate_failed",
+                "failed_generation": "max completion tokens reached before generating a valid document",
+            }
+        }
+        error = httpx.HTTPStatusError(
+            "Client error '400'", request=MagicMock(), response=response
+        )
+
+        text = _format_llm_error(error)
+
+        assert "HTTP 400" in text
+        assert "json_validate_failed" in text
+        assert "max completion tokens reached" in text
+
+    def test_400_without_json_body_has_no_hint(self):
+        response = MagicMock()
+        response.status_code = 400
+        response.json.side_effect = ValueError("not json")
+        error = httpx.HTTPStatusError(
+            "Client error '400'", request=MagicMock(), response=response
+        )
+
+        assert _format_llm_error(error).endswith("HTTP 400: Client error '400'")
+
     def test_read_error_is_network_error(self):
         # Регрессия: ReadError раньше попадал в общий str(exc) — админу
         # уходило непонятное «Ошибка LLM API: ReadError».
@@ -95,6 +129,35 @@ class TestFormatLlmError:
     def test_non_http_exception(self):
         assert "boom" in _format_llm_error(ValueError("boom"))
         assert _format_llm_error(ValueError()) == "ValueError"
+
+
+class TestCleanReason:
+    def test_short_reason_unchanged(self):
+        assert clean_reason("Подходит по стеку") == "Подходит по стеку"
+
+    def test_whitespace_collapsed(self):
+        assert clean_reason("Подходит\n\nпо   стеку") == "Подходит по стеку"
+
+    def test_empty_and_none(self):
+        assert clean_reason(None) == ""
+        assert clean_reason("") == ""
+
+    def test_monologue_cut_at_sentence_boundary(self):
+        # Реальный ответ qwen: в reason уехало рассуждение вместо обоснования.
+        dump = (
+            "Бюджет 5000 UAH (≈ 125-130 USD) ниже минимального порога в 100 USD? "
+            "Нет, 5000 UAH ≈ 125 USD, что выше 100. Однако, давайте пересчитаем. "
+            "Почему тогда REJECT? Может быть, я должен был ACCEPT. "
+        ) * 3
+
+        text = clean_reason(dump)
+
+        assert len(text) <= REASON_MAX_CHARS
+        assert text.endswith(("?", ".", "!"))
+
+    def test_long_single_sentence_cut_by_length(self):
+        text = clean_reason("а" * (REASON_MAX_CHARS + 50))
+        assert len(text) == REASON_MAX_CHARS
 
 
 class TestIsQuotaError:
@@ -247,6 +310,15 @@ class TestJudgeVacancyParsing:
             result = await judge_vacancy("vacancy text", {})
         assert result["decision"] == "REVIEW"
         assert result["reason"] == "Failed to parse LLM response"
+
+    async def test_reason_is_trimmed_by_length(self):
+        long_reason = "Критерии не совпадают. " + "Почему тогда ACCEPT? " * 30
+        content = '{"decision": "REJECT", "reason": "' + long_reason + '"}'
+        payload = {"choices": [{"message": {"content": content}}]}
+        with patch("src.llm._call_llm_with_retry", new=AsyncMock(return_value=payload)):
+            result = await judge_vacancy("vacancy text", {})
+        assert len(result["reason"]) <= REASON_MAX_CHARS
+        assert result["reason"].startswith("Критерии не совпадают.")
 
 
 def _rate_limit_error(retry_after: str | None = None, message: str | None = None):

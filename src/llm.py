@@ -87,10 +87,19 @@ DAILY_LIMIT_COOLDOWN_SECONDS = 900  # 15 минут
 # gpt-oss-120b тратит бюджет на reasoning. reasoning_effort=low проверен на
 # живой модели: 436 -> 237 токенов на вызов при том же JSON-решении.
 REASONING_EFFORT = "low"
-# Запас на reasoning + JSON: на 400 токенах qwen в режиме json_object
-# обрывался и провайдер отвечал 400 json_validate_failed вместо решения.
-MAX_TOKENS_JUDGE = 800
+# Запас на reasoning + JSON. Провайдер не всегда отделяет рассуждения от ответа:
+# qwen на Groq (reasoning_effort ему не отправляем) печатает размышления прямо
+# в content, и на 800 токенах JSON обрывался — провайдер отвечал
+# 400 json_validate_failed «max completion tokens reached», а пост оставался
+# без вердикта. max_tokens — потолок, а не резерв: gpt-oss-120b на том же
+# посте останавливается сам на ~240 токенах.
+MAX_TOKENS_JUDGE = 2000
 MAX_TOKENS_RESPONSE = 1600
+# Обоснование вердикта уходит админу в сообщении: рассуждение целиком туда
+# не влезает и читается как бред, поэтому режем по границе предложения.
+REASON_MAX_CHARS = 200
+# Сколько знаков пояснения провайдера показывать в тексте ошибки.
+PROVIDER_HINT_CHARS = 200
 
 # Израсходованные токены: пары (момент времени, токенов за вызов).
 _spent_tokens: deque[tuple[float, int]] = deque()
@@ -204,6 +213,29 @@ def _remember_spent(result: dict) -> None:
         _spent_tokens.append((time.monotonic(), tokens))
 
 
+def _provider_hint(response) -> str:
+    """Пояснение провайдера из тела ошибки: «HTTP 400» без него бесполезен.
+
+    Groq на обрезанный JSON отвечает 400 json_validate_failed и пишет причину
+    в error.message / error.code / failed_generation — без неё в уведомлении
+    админа видно только «HTTP 400», и диагноз приходится снимать вручную.
+    """
+    try:
+        error = response.json().get("error", {})
+    except (ValueError, AttributeError, TypeError):
+        return ""
+    if not isinstance(error, dict):
+        return ""
+    parts = [
+        str(error.get(key))
+        for key in ("message", "code", "failed_generation")
+        if error.get(key)
+    ]
+    if not parts:
+        return ""
+    return " — " + " | ".join(parts)[:PROVIDER_HINT_CHARS]
+
+
 def _format_llm_error(exc: BaseException) -> str:
     """Human-readable description of an LLM API error."""
     if isinstance(exc, httpx.HTTPStatusError):
@@ -217,7 +249,7 @@ def _format_llm_error(exc: BaseException) -> str:
             return "429 Too Many Requests — лимит провайдера исчерпан" + (
                 f" ({reason})" if reason else ""
             )
-        return f"HTTP {status}: {exc}"
+        return f"HTTP {status}: {exc}" + _provider_hint(exc.response)
     # Порядок важен: TimeoutException — подкласс TransportError.
     if isinstance(exc, httpx.TimeoutException):
         return "таймаут запроса к LLM API"
@@ -297,6 +329,22 @@ def _reasoning_params() -> dict:
     if "qwen" in model:
         return {}
     return {"reasoning_effort": REASONING_EFFORT}
+
+
+def clean_reason(value: Any) -> str:
+    """Обоснование вердикта — одной короткой строкой.
+
+    Провайдер не всегда отделяет рассуждения от ответа: qwen на Groq печатает
+    их прямо в content, и в поле reason уезжал монолог («Давайте проверим ещё
+    раз… Почему тогда REJECT?»). Обрезаем по границе предложения: админ должен
+    видеть вердикт, а не ход мыслей модели.
+    """
+    text = " ".join(str(value or "").split())
+    if len(text) <= REASON_MAX_CHARS:
+        return text
+    head = text[:REASON_MAX_CHARS]
+    cut = max(head.rfind(". "), head.rfind("! "), head.rfind("? "))
+    return head[: cut + 1] if cut > 0 else head
 
 
 def normalize_decision(value: Any) -> str:
@@ -443,7 +491,7 @@ async def judge_vacancy(text: str, filter_rules: dict) -> dict:
         }
     return {
         "decision": normalize_decision(data.get("decision")),
-        "reason": data.get("reason", ""),
+        "reason": clean_reason(data.get("reason", "")),
         "price_estimate": data.get("price_estimate"),
     }
 
